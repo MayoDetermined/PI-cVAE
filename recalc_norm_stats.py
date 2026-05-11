@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Recalculate normalization statistics from both train and test data.
-This fixes cases where stats are outdated or computed from different dataset.
 """
 
 import numpy as np
