@@ -109,36 +109,80 @@ class MomentumConservationLoss:
     
     def _compute_cell_volumes(self) -> None:
         """
-        Compute cell volumes from geometry coordinates.
-        Uses corner coordinates (crx, cry) to calculate area of each cell.
+        Compute cell volumes and boundary face lengths from geometry coordinates.
+        Uses corner coordinates (crx, cry) to calculate the area of each cell
+        and the lengths of the three outflow boundary faces.
+
+        SOLPS-ITER corner convention (0-indexed):
+          0 = inner-lower  (small i, small j)
+          1 = outer-lower  (large i, small j)
+          2 = outer-upper  (large i, large j)
+          3 = inner-upper  (small i, large j)
+
+        Derived boundary faces:
+          Outer radial face  (i = nx-1): corners 1 → 2
+          Lower poloidal face (j = 0)  : corners 0 → 1
+          Upper poloidal face (j = ny-1): corners 3 → 2
         """
         if self.data_handler.crx is None or self.data_handler.cry is None:
-            # Fallback: uniform grid cells
+            # Fallback: uniform grid cells and unit face lengths
             nx, ny = self.data_handler.GRID_DIM
-            self.cell_volumes = np.ones((nx, ny))
+            self.cell_volumes    = torch.ones((nx, ny),  dtype=torch.float32)
+            self.face_len_outer    = torch.ones(ny,       dtype=torch.float32)
+            self.face_len_pol_low  = torch.ones(nx,       dtype=torch.float32)
+            self.face_len_pol_high = torch.ones(nx,       dtype=torch.float32)
             return
-        
+
         crx = self.data_handler.crx  # (nx, ny, 4)
         cry = self.data_handler.cry  # (nx, ny, 4)
-        
+
         nx, ny = crx.shape[:2]
         cell_volumes = np.zeros((nx, ny))
-        
-        # For each cell, compute area using the Shoelace formula
+
+        # Cell areas via the Shoelace formula
         for i in range(nx):
             for j in range(ny):
                 x = crx[i, j, :]
                 y = cry[i, j, :]
-                
-                # Shoelace formula for polygon area
-                area = 0.5 * np.abs(
+                cell_volumes[i, j] = 0.5 * np.abs(
                     np.sum(x * np.roll(y, 1)) - np.sum(y * np.roll(x, 1))
                 )
-                cell_volumes[i, j] = area
-        
-        # Normalize to unit sum for numerical stability
-        self.cell_volumes = cell_volumes / np.mean(cell_volumes)
-        self.cell_volumes = torch.tensor(self.cell_volumes, dtype=torch.float32)
+
+        # Normalize to unit mean for numerical stability
+        self.cell_volumes = torch.tensor(
+            cell_volumes / np.mean(cell_volumes), dtype=torch.float32
+        )
+
+        def _face_len(x0, y0, x1, y1):
+            """Euclidean length of a face between two corner arrays."""
+            return np.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
+
+        # Outer radial face (i = nx-1): between corners 1 and 2  →  shape (ny,)
+        fl_outer = _face_len(
+            crx[-1, :, 1], cry[-1, :, 1],
+            crx[-1, :, 2], cry[-1, :, 2],
+        )
+        self.face_len_outer = torch.tensor(
+            fl_outer / np.mean(fl_outer), dtype=torch.float32
+        )
+
+        # Lower poloidal face (j = 0): between corners 0 and 1  →  shape (nx,)
+        fl_pol_low = _face_len(
+            crx[:, 0, 0], cry[:, 0, 0],
+            crx[:, 0, 1], cry[:, 0, 1],
+        )
+        self.face_len_pol_low = torch.tensor(
+            fl_pol_low / np.mean(fl_pol_low), dtype=torch.float32
+        )
+
+        # Upper poloidal face (j = ny-1): between corners 3 and 2  →  shape (nx,)
+        fl_pol_high = _face_len(
+            crx[:, -1, 3], cry[:, -1, 3],
+            crx[:, -1, 2], cry[:, -1, 2],
+        )
+        self.face_len_pol_high = torch.tensor(
+            fl_pol_high / np.mean(fl_pol_high), dtype=torch.float32
+        )
     
     def compute_total_momentum(self,
                               na: torch.Tensor,
@@ -172,63 +216,20 @@ class MomentumConservationLoss:
         
         return total_momentum
     
-    def compute_momentum_by_species(self,
-                                   na: torch.Tensor,
-                                   ua: torch.Tensor) -> torch.Tensor:
-        """
-        Compute momentum for each species separately.
-        
-        Args:
-            na: Species densities (batch, nx, ny, n_species)
-            ua: Species velocities (batch, nx, ny, n_species)
-        
-        Returns:
-            Momentum per species (batch, n_species)
-        """
-        # Prepare mass tensor
-        masses = self.masses_kg.to(ua.device)
-        if masses.dim() == 1:
-            masses = masses.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-        
-        # Momentum density: m_a * n_a * u_a
-        momentum_density = masses * na * ua  # (batch, nx, ny, n_species)
-        
-        # Sum over spatial dimensions
-        cell_volumes = self.cell_volumes.to(momentum_density.device)
-        if cell_volumes.dim() == 2:
-            cell_volumes = cell_volumes.unsqueeze(0).unsqueeze(-1)
-        
-        momentum_by_species = (momentum_density * cell_volumes).sum(dim=(1, 2))  # (batch, n_species)
-        
-        return momentum_by_species
-    
     def compute_charge_effects(self,
-                              na: torch.Tensor,
-                              te: torch.Tensor,
-                              ti: torch.Tensor,
-                              B: Optional[torch.Tensor] = None) -> torch.Tensor:
+                              na: torch.Tensor) -> torch.Tensor:
         """
-        Compute electromagnetic force effects on momentum.
-        
-        Charged particles are affected by magnetic force: F = q * v × B
-        Neutrals are not affected.
-        
-        This term represents the expected momentum loss/gain due to Lorentz force.
-        
+        Compute quasi-neutrality penalty.
+
+        Enforces that the net charge density rho_q = sum_a(Z_a * n_a) is
+        spatially uniform (low variance), as expected in a quasi-neutral plasma.
+
         Args:
             na: Species densities (batch, nx, ny, n_species)
-            te: Electron temperature (batch, nx, ny)
-            ti: Ion temperature (batch, nx, ny)
-            B: Magnetic field strength (batch,) - can extract from input parameters if available
-        
+
         Returns:
             Charge-related momentum effect penalty (scalar)
         """
-        if te.dim() == 4:
-            te = te.squeeze(-1)
-        if ti.dim() == 4:
-            ti = ti.squeeze(-1)
-        
         # Charge tensor: (1, 1, 1, n_species)
         charges = torch.tensor(self.charges, dtype=torch.float32, device=na.device)
         charges = charges.view(1, 1, 1, -1)
@@ -248,32 +249,47 @@ class MomentumConservationLoss:
                              na: torch.Tensor,
                              ua: torch.Tensor) -> torch.Tensor:
         """
-        Compute momentum flux at domain boundaries.
-        
-        Momentum flux = integral(n * m * u^2 * dS) at boundary
-        
+        Compute total outgoing momentum flux across all domain boundaries.
+
+        Phi = sum_boundaries sum_alpha m_alpha * n_alpha * u_alpha^2 * delta_S
+
+        Three outflow surfaces are considered:
+          - Outer radial wall  (i = nx-1)       weighted by face_len_outer    (ny,)
+          - Lower poloidal target (j = 0)       weighted by face_len_pol_low  (nx,)
+          - Upper poloidal target (j = ny-1)    weighted by face_len_pol_high (nx,)
+
+        u_a^2 is used (always positive) so the penalty is insensitive to the
+        sign convention of the parallel velocity.
+
         Args:
             na: Species densities (batch, nx, ny, n_species)
             ua: Species velocities (batch, nx, ny, n_species)
-        
+
         Returns:
-            Momentum flux at boundaries (batch,)
+            Total boundary momentum flux per sample (batch,)
         """
-        batch_size = ua.shape[0]
-        
-        # Prepare mass tensor
         masses = self.masses_kg.to(ua.device)
         if masses.dim() == 1:
             masses = masses.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-        
-        # Momentum flux density: m_a * n_a * u_a^2
-        momentum_flux_density = masses * na * (ua ** 2)  # (batch, nx, ny, n_species)
-        
-        # Extract boundary values (radial boundary at nx-1)
-        # Sum over poloidal direction
-        flux_radial = momentum_flux_density[:, -1, :, :].sum(dim=(1, 2))  # (batch,)
-        
-        return flux_radial
+
+        # Momentum flux density: m_a * n_a * u_a^2  (batch, nx, ny, n_species)
+        flux_density = masses * na * (ua ** 2)
+
+        # --- Outer radial boundary (i = nx-1) ---
+        # face_len_outer: (ny,) → (1, ny, 1) for broadcasting over (batch, ny, n_species)
+        face_outer = self.face_len_outer.to(ua.device).view(1, -1, 1)
+        flux_outer = (flux_density[:, -1, :, :] * face_outer).sum(dim=(1, 2))  # (batch,)
+
+        # --- Lower poloidal target (j = 0) ---
+        # face_len_pol_low: (nx,) → (1, nx, 1) for broadcasting over (batch, nx, n_species)
+        face_pol_low = self.face_len_pol_low.to(ua.device).view(1, -1, 1)
+        flux_pol_low = (flux_density[:, :, 0, :] * face_pol_low).sum(dim=(1, 2))  # (batch,)
+
+        # --- Upper poloidal target (j = ny-1) ---
+        face_pol_high = self.face_len_pol_high.to(ua.device).view(1, -1, 1)
+        flux_pol_high = (flux_density[:, :, -1, :] * face_pol_high).sum(dim=(1, 2))  # (batch,)
+
+        return flux_outer + flux_pol_low + flux_pol_high
     
     def check_poloidal_periodicity(self,
                                   field: torch.Tensor,
@@ -316,10 +332,8 @@ class MomentumConservationLoss:
                 na_pred: torch.Tensor,
                 ua_pred: torch.Tensor,
                 te_pred: torch.Tensor,
-                X_pred: Optional[torch.Tensor] = None,
                 na_true: Optional[torch.Tensor] = None,
-                ua_true: Optional[torch.Tensor] = None,
-                te_true: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                ua_true: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         Compute momentum conservation loss.
         
@@ -327,10 +341,8 @@ class MomentumConservationLoss:
             na_pred: Predicted species densities (batch, nx, ny, n_species)
             ua_pred: Predicted species velocities (batch, nx, ny, n_species)
             te_pred: Predicted electron temperature (batch, nx, ny)
-            X_pred: Predicted input parameters (batch, 8) - optional, for B field extraction
             na_true: Ground truth densities (optional)
             ua_true: Ground truth velocities (optional)
-            te_true: Ground truth temperature (optional)
         
         Returns:
             Dictionary with loss components:
@@ -384,13 +396,7 @@ class MomentumConservationLoss:
         
         # ============== CHARGE-DEPENDENT EFFECTS ==============
         # Account for electromagnetic forces on ions vs neutrals
-        if te_pred.dim() == 4:
-            te_for_charges = te_pred.squeeze(-1)
-        else:
-            te_for_charges = te_pred
-        
-        loss_charge_effects = self.compute_charge_effects(na_pred, te_for_charges, 
-                                                          torch.zeros_like(te_for_charges))
+        loss_charge_effects = self.compute_charge_effects(na_pred)
         
         losses['loss_charge_effects'] = loss_charge_effects
         
@@ -435,10 +441,8 @@ def momentum_conservation_loss(predictions: Dict[str, torch.Tensor],
         na_pred=predictions['na'],
         ua_pred=predictions['ua'],
         te_pred=predictions['te'],
-        X_pred=predictions.get('X'),
         na_true=target_dict.get('na'),
         ua_true=target_dict.get('ua'),
-        te_true=target_dict.get('te'),
     )
     
     return loss_dict['loss_total']

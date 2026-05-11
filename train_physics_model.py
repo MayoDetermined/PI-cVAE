@@ -337,8 +337,7 @@ def train_epoch(
 
             momentum_dict = loss_fns["momentum"].forward(
                 na_pred=na_pred, ua_pred=ua_pred, te_pred=te_pred,
-                X_pred=cond,
-                na_true=na_true, ua_true=ua_true, te_true=te_true,
+                na_true=na_true, ua_true=ua_true,
             )
             loss_momentum = momentum_dict["loss_total"]
         else:
@@ -400,8 +399,7 @@ def val_epoch(
             )
             momentum_dict = loss_fns["momentum"].forward(
                 na_pred=na_pred, ua_pred=ua_pred, te_pred=te_pred,
-                X_pred=cond,
-                na_true=na_true, ua_true=ua_true, te_true=te_true,
+                na_true=na_true, ua_true=ua_true,
             )
             loss_energy = energy_dict["loss_total"]
             loss_momentum = momentum_dict["loss_total"]

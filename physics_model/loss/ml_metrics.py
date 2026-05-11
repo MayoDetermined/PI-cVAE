@@ -15,12 +15,6 @@ logger = logging.getLogger(__name__)
 class KLDivergenceLoss:
     """
     KL Divergence loss for comparing probability distributions in plasma fields.
-    
-    Useful for:
-    - Comparing predicted vs ground truth field distributions
-    - Regularizing VAE latent spaces
-    - Distribution matching in adversarial training
-    - Penalizing unphysical probability distributions
     """
     
     def __init__(self, 

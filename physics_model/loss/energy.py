@@ -24,8 +24,29 @@ ATOMIC_MASSES = {
     'N7': 14.0,     # Nitrogen ion N+7
 }
 
+# Charge numbers (ionization state) per species
+# Used for quasineutrality: n_e = sum_a Z_a * n_a
+CHARGE_NUMBERS = {
+    'D0': 0,    # Deuterium neutral
+    'D1': 1,    # Deuterium ion
+    'N0': 0,    # Nitrogen neutral
+    'N1': 1,    # N+1
+    'N2': 2,    # N+2
+    'N3': 3,    # N+3
+    'N4': 4,    # N+4
+    'N5': 5,    # N+5
+    'N6': 6,    # N+6
+    'N7': 7,    # N+7
+}
+
 # Convert atomic mass units to kg (1 u = 1.66053906660e-27 kg)
 AMU_TO_KG = 1.66053906660e-27
+
+# Convert eV to Joules (elementary charge)
+EV_TO_J = 1.602176634e-19  # J/eV
+
+# Thermal degrees of freedom factor f/2 (f=3 for 3D ideal plasma)
+THERMAL_DOF_FACTOR = 1.5
 
 
 class EnergyConservationLoss:
@@ -67,6 +88,10 @@ class EnergyConservationLoss:
         # Prepare mass array for kinetic energy calculation
         self.masses = np.array([ATOMIC_MASSES[name] for name in self.species_names])
         self.masses_kg = torch.tensor(self.masses * AMU_TO_KG, dtype=torch.float32)
+
+        # Charge numbers for quasineutrality: n_e = sum_a Z_a * n_a
+        charges = np.array([CHARGE_NUMBERS[name] for name in self.species_names])
+        self.charges_t = torch.tensor(charges, dtype=torch.float32)
         
         # Compute cell volumes/areas from geometry
         self._compute_cell_volumes()
@@ -110,43 +135,44 @@ class EnergyConservationLoss:
                               ti: torch.Tensor,
                               na: torch.Tensor) -> torch.Tensor:
         """
-        Compute thermal (potential) energy density.
-        
-        E_thermal = integral over domain of sum_species(n_a * (T_e + T_i))
-        
+        Compute thermal energy integrated over the domain.
+
+        Correct physical split (quasineutral plasma):
+          n_e = sum_a Z_a * n_a          (quasineutrality)
+          E_e = (3/2) * n_e * e * T_e   [J/m^3]
+          E_i = (3/2) * sum_a n_a * e * T_i  [J/m^3]  (shared T_i)
+          E_thermal = integral (E_e + E_i) dV
+
         Args:
-            te: Electron temperature (batch, nx, ny) or (batch, nx, ny, 1)
-            ti: Ion temperature (batch, nx, ny) or (batch, nx, ny, 1)
-            na: Species densities (batch, nx, ny, n_species)
-        
+            te: Electron temperature [eV] (batch, nx, ny) or (batch, nx, ny, 1)
+            ti: Ion temperature [eV]      (batch, nx, ny) or (batch, nx, ny, 1)
+            na: Species densities [m^-3] (batch, nx, ny, n_species)
+
         Returns:
-            Thermal energy per sample (batch,)
+            Thermal energy per sample [J] (batch,)
         """
-        # Handle channel dimension if present
         if te.dim() == 4:
             te = te.squeeze(-1)
         if ti.dim() == 4:
             ti = ti.squeeze(-1)
-        
-        # Ensure te and ti are broadcast-compatible with na
-        batch_size = na.shape[0]
-        nx, ny = na.shape[1:3]
-        
-        # Expand to (batch, nx, ny, n_species)
-        te_expanded = te.unsqueeze(-1).expand(-1, -1, -1, na.shape[-1])
-        ti_expanded = ti.unsqueeze(-1).expand(-1, -1, -1, na.shape[-1])
-        
-        # Thermal energy density: n_a * (T_e + T_i) [eV]
-        # Note: temperatures are in eV, densities in m^-3
-        energy_density = na * (te_expanded + ti_expanded)  # (batch, nx, ny, n_species)
-        
-        # Sum over species and multiply by cell volumes
-        cell_volumes = self.cell_volumes.to(energy_density.device)
-        if cell_volumes.dim() == 2:
-            cell_volumes = cell_volumes.unsqueeze(0).unsqueeze(-1)
-        
-        thermal_energy = (energy_density * cell_volumes).sum(dim=(1, 2, 3))  # (batch,)
-        
+
+        cell_volumes = self.cell_volumes.to(na.device)  # (nx, ny)
+        charges = self.charges_t.to(na.device)          # (n_species,)
+
+        # Electron density from quasineutrality: n_e = sum_a Z_a * n_a
+        n_e = (na * charges).sum(dim=-1)  # (batch, nx, ny)
+
+        # Electron thermal energy density: (3/2) * n_e * e * T_e  [J/m^3]
+        e_density_electrons = THERMAL_DOF_FACTOR * EV_TO_J * n_e * te  # (batch, nx, ny)
+
+        # Ion thermal energy density: (3/2) * (sum_a n_a) * e * T_i  [J/m^3]
+        n_ions_total = na.sum(dim=-1)  # (batch, nx, ny)
+        e_density_ions = THERMAL_DOF_FACTOR * EV_TO_J * n_ions_total * ti  # (batch, nx, ny)
+
+        # Integrate over cell volumes
+        e_density_total = e_density_electrons + e_density_ions  # (batch, nx, ny)
+        thermal_energy = (e_density_total * cell_volumes.unsqueeze(0)).sum(dim=(1, 2))  # (batch,)
+
         return thermal_energy
     
     def compute_kinetic_energy(self,
@@ -223,49 +249,6 @@ class EnergyConservationLoss:
         energy_flux = (na_boundary * te_boundary * ua_boundary).mean()
         
         return energy_flux
-    
-    def compute_poloidal_flux(self,
-                             te: torch.Tensor,
-                             ti: torch.Tensor,
-                             na: torch.Tensor,
-                             ua: torch.Tensor) -> torch.Tensor:
-        """
-        Compute energy flux in poloidal direction (along y-axis).
-        Takes into account the circularity/periodicity of poloidal axis.
-        
-        In tokamaks, poloidal direction is periodic (circular).
-        Energy flux: Phi = integral(n * T * u * dS)
-        
-        Args:
-            te: Electron temperature (batch, nx, ny)
-            ti: Ion temperature (batch, nx, ny)
-            na: Species densities (batch, nx, ny, n_species)
-            ua: Species velocities (batch, nx, ny, n_species)
-        
-        Returns:
-            Poloidal energy flux for each toroidal position (batch, nx)
-        """
-        if te.dim() == 4:
-            te = te.squeeze(-1)
-        if ti.dim() == 4:
-            ti = ti.squeeze(-1)
-        
-        batch_size, nx, ny = te.shape
-        n_species = na.shape[-1]
-        
-        # Combine temperatures: total thermal energy per particle
-        temp_total = te + ti if ti is not None else te  # (batch, nx, ny)
-        
-        # Expand to species dimension
-        temp_expanded = temp_total.unsqueeze(-1).expand(-1, -1, -1, n_species)  # (batch, nx, ny, n_species)
-        
-        # Energy flux density: n_a * T * u_a
-        flux_density = na * temp_expanded * ua  # (batch, nx, ny, n_species)
-        
-        # Sum over species and integrate along poloidal direction
-        poloidal_flux = flux_density.sum(dim=-1).sum(dim=-1)  # (batch, nx)
-        
-        return poloidal_flux
     
     def check_poloidal_periodicity(self,
                                   field: torch.Tensor,
@@ -380,7 +363,7 @@ class EnergyConservationLoss:
         
         # ============== POLOIDAL CIRCULARITY CONSTRAINTS ==============
         # Enforce periodicity along poloidal axis (y-direction)
-        # All physical fields must satisfy periodic boundary conditions
+        # All physical fields must satisfy periodic boundary conditions 
         
         loss_poloidal_te = self.check_poloidal_periodicity(te_pred, method='mse')
         loss_poloidal_ti = self.check_poloidal_periodicity(ti_pred, method='mse') if ti_pred is not None else torch.tensor(0.0, device=te_pred.device)
