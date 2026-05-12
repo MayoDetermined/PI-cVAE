@@ -206,8 +206,8 @@ def load_model(checkpoint_path: str, device: torch.device) -> ConditionalVAE:
     model.load_state_dict(ckpt["model"])
     model.eval()
     epoch = ckpt.get("epoch", "?")
-    best  = ckpt.get("best_val_loss", float("inf"))
-    print(f"Checkpoint: epoch={epoch}, best_val_loss={best:.4f}")
+    best  = ckpt.get("best_val_recon", ckpt.get("best_val_loss", float("inf")))
+    print(f"Checkpoint: epoch={epoch}, best_val_recon={best:.4f}")
     return model
 
 
@@ -243,20 +243,21 @@ def unpack_norm(x: np.ndarray):
 # ---------------------------------------------------------------------------
 
 def print_diagnostics(gt_norm, pred_norm, denorm):
-    print("\n" + "=" * 75)
+    print("\n" + "=" * 80)
     print("DIAGNOSTICS  (normalised space  — expected range [0, 1])")
-    print("=" * 75)
+    print(f"  {'head':>4s}  {'GT range':>18s}  {'Pred range':>18s}  {'RMSE':>8s}  {'corr':>7s}")
+    print("-" * 80)
     for fname, sl in [("te", slice(0, 1)), ("ti", slice(1, 2)),
                       ("na", slice(2, 12)), ("ua", slice(12, 22))]:
         g  = gt_norm[sl]
         p  = pred_norm[sl]
         rmse = np.sqrt(np.mean((p - g) ** 2))
+        corr = float(np.corrcoef(p.ravel(), g.ravel())[0, 1])
         print(
-            f"  {fname:3s}  GT   [{g.min():+.3f}, {g.max():+.3f}]  mean={g.mean():+.4f}"
-        )
-        print(
-            f"       Pred [{p.min():+.3f}, {p.max():+.3f}]  mean={p.mean():+.4f}"
-            f"  RMSE(norm)={rmse:.4f}"
+            f"  {fname:>4s}  "
+            f"[{g.min():+.3f}, {g.max():+.3f}]  "
+            f"[{p.min():+.3f}, {p.max():+.3f}]  "
+            f"{rmse:8.4f}  {corr:+.4f}"
         )
 
     print("\nPHYSICAL SPACE  (after denorm)")
@@ -423,32 +424,69 @@ def make_comparison_figure(
 
 def make_norm_space_figure(gt_norm, pred_norm, sample_idx):
     """
-    2 × 11 heatmap of the first 11 raw normalised channels.
-    Useful to check whether the model outputs are in a sensible range.
+    Normalised-space heatmaps for all 22 channels, grouped by decoder head.
+
+    Layout: 6 rows × 10 cols
+      rows 0-1  : te (col 0) and ti (col 1)   — scalar heads
+      rows 2-3  : na species 0-9               — na head
+      rows 4-5  : ua species 0-9               — ua head
+    Each pair of rows is (GT, Pred). Cmaps match physical meaning:
+      te/ti → inferno,  na → viridis,  ua → RdBu_r (centred on 0.5 = zero vel)
     """
-    ch_names = (
-        ["te", "ti"]
-        + [f"na_{s}" for s in SPECIES_NAMES]
-        + [f"ua_{s}" for s in SPECIES_NAMES]
-    )
-    fig, axes = plt.subplots(2, 11, figsize=(26, 5), squeeze=False)
+    fig, axes = plt.subplots(6, 10, figsize=(24, 12), squeeze=False)
     fig.suptitle(
-        f"Normalised space — sample idx={sample_idx}  "
-        "|  GT (top) / Pred (bottom)  (range should be ≈ [0, 1])",
+        f"Normalised space — per decoder head — sample idx={sample_idx}\n"
+        "rows 0/2/4: GT  ·  rows 1/3/5: Pred  (expected ≈ [0, 1])",
         fontsize=11, fontweight="bold",
     )
-    for ch in range(11):
+
+    section_labels = [
+        "te / ti  (GT)", "te / ti  (Pred)",
+        "na head  (GT)", "na head  (Pred)",
+        "ua head  (GT)", "ua head  (Pred)",
+    ]
+    for r, lbl in enumerate(section_labels):
+        axes[r, 0].set_ylabel(lbl, fontsize=8)
+
+    def _show(ax, data, norm, cmap):
+        ax.imshow(data, aspect="auto", origin="lower", norm=norm, cmap=cmap)
+        ax.axis("off")
+
+    # ── te (ch 0)  and  ti (ch 1) ─────────────────────────────────────────
+    for col, (ch, name) in enumerate([(0, "te"), (1, "ti")]):
         vmin = min(gt_norm[ch].min(), pred_norm[ch].min())
         vmax = max(gt_norm[ch].max(), pred_norm[ch].max())
-        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-        axes[0, ch].imshow(gt_norm[ch],   aspect="auto", origin="lower",
-                           norm=norm, cmap="viridis")
-        axes[1, ch].imshow(pred_norm[ch], aspect="auto", origin="lower",
-                           norm=norm, cmap="viridis")
-        axes[0, ch].set_title(ch_names[ch], fontsize=7)
-        axes[0, ch].axis("off")
-        axes[1, ch].axis("off")
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
+        n = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        _show(axes[0, col], gt_norm[ch],   n, "inferno")
+        _show(axes[1, col], pred_norm[ch], n, "inferno")
+        axes[0, col].set_title(name, fontsize=7)
+    for col in range(2, 10):
+        axes[0, col].axis("off")
+        axes[1, col].axis("off")
+
+    # ── na head (ch 2–11) ─────────────────────────────────────────────────
+    for sp in range(10):
+        ch = 2 + sp
+        vmin = min(gt_norm[ch].min(), pred_norm[ch].min())
+        vmax = max(gt_norm[ch].max(), pred_norm[ch].max())
+        n = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        _show(axes[2, sp], gt_norm[ch],   n, "viridis")
+        _show(axes[3, sp], pred_norm[ch], n, "viridis")
+        axes[2, sp].set_title(f"na {SPECIES_NAMES[sp]}", fontsize=6)
+
+    # ── ua head (ch 12–21) ────────────────────────────────────────────────
+    for sp in range(10):
+        ch = 12 + sp
+        vmin = min(gt_norm[ch].min(), pred_norm[ch].min())
+        vmax = max(gt_norm[ch].max(), pred_norm[ch].max())
+        # Centre RdBu on 0.5  (= zero velocity in normalised space)
+        absdev = max(abs(vmin - 0.5), abs(vmax - 0.5), 1e-6)
+        n = mcolors.Normalize(vmin=0.5 - absdev, vmax=0.5 + absdev)
+        _show(axes[4, sp], gt_norm[ch],   n, "RdBu_r")
+        _show(axes[5, sp], pred_norm[ch], n, "RdBu_r")
+        axes[4, sp].set_title(f"ua {SPECIES_NAMES[sp]}", fontsize=6)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     return fig
 
 

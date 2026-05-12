@@ -102,33 +102,58 @@ class EnergyConservationLoss:
         Uses corner coordinates (crx, cry) to calculate area of each cell.
         """
         if self.data_handler.crx is None or self.data_handler.cry is None:
-            # Fallback: uniform grid cells
+            # Fallback: uniform grid cells and unit face lengths
             nx, ny = self.data_handler.GRID_DIM
-            self.cell_volumes = np.ones((nx, ny))
+            self.cell_volumes    = torch.ones((nx, ny), dtype=torch.float32)
+            self.face_len_outer    = torch.ones(ny,     dtype=torch.float32)
+            self.face_len_pol_low  = torch.ones(nx,     dtype=torch.float32)
+            self.face_len_pol_high = torch.ones(nx,     dtype=torch.float32)
             return
-        
-        crx = self.data_handler.crx  # (nx, ny, 4)
-        cry = self.data_handler.cry  # (nx, ny, 4)
-        
+
+        crx = self.data_handler.crx  # (nx, ny, 4)  — R [m]
+        cry = self.data_handler.cry  # (nx, ny, 4)  — Z [m]
+
         nx, ny = crx.shape[:2]
         cell_volumes = np.zeros((nx, ny))
-        
-        # For each cell, compute area using the Shoelace formula
-        # Corners are ordered: [0]=LL, [1]=LR, [2]=UR, [3]=UL
-        for i in range(nx):
-            for j in range(ny):
-                x = crx[i, j, :]  # x-coordinates of 4 corners
-                y = cry[i, j, :]  # y-coordinates of 4 corners
-                
-                # Shoelace formula for polygon area
-                area = 0.5 * np.abs(
-                    np.sum(x * np.roll(y, 1)) - np.sum(y * np.roll(x, 1))
-                )
-                cell_volumes[i, j] = area
-        
-        # Normalize to unit sum for numerical stability
-        self.cell_volumes = cell_volumes / np.mean(cell_volumes)
-        self.cell_volumes = torch.tensor(self.cell_volumes, dtype=torch.float32)
+
+        # Shoelace formula: 2D cell area in the (R, Z) poloidal plane [m^2]
+        # Vectorised over all cells
+        x = crx  # (nx, ny, 4)
+        y = cry
+        # Shoelace: A = 0.5 * |sum_k x_k*(y_{k-1} - y_{k+1})|
+        cell_volumes = 0.5 * np.abs(
+            x[:, :, 0] * (y[:, :, 3] - y[:, :, 1]) +
+            x[:, :, 1] * (y[:, :, 0] - y[:, :, 2]) +
+            x[:, :, 2] * (y[:, :, 1] - y[:, :, 3]) +
+            x[:, :, 3] * (y[:, :, 2] - y[:, :, 0])
+        )
+
+        # Toroidal Jacobian: in cylindrical (R, phi, Z) geometry the 3-D volume
+        # element is  dV = R * dR * dZ * dphi = 2*pi*R * dA  (assuming toroidal
+        # symmetry, i.e. the SOLPS 2-D approximation).  crx stores R [m], so
+        # R_center = mean of the 4 corner R-values for each cell.
+        R_center = crx.mean(axis=2)  # (nx, ny)
+        cell_volumes = cell_volumes * R_center  # weight by toroidal Jacobian
+
+        # Normalise to unit mean for numerical stability
+        mean_vol = cell_volumes[cell_volumes > 0].mean()
+        self.cell_volumes = torch.tensor(cell_volumes / mean_vol, dtype=torch.float32)
+
+        # Boundary face lengths (same SOLPS corner convention as MomentumConservationLoss)
+        def _face_len(x0, y0, x1, y1):
+            return np.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
+
+        # Outer radial face (i = nx-1): corners 1 → 2  → shape (ny,)
+        fl_outer = _face_len(crx[-1, :, 1], cry[-1, :, 1], crx[-1, :, 2], cry[-1, :, 2])
+        self.face_len_outer = torch.tensor(fl_outer / np.mean(fl_outer), dtype=torch.float32)
+
+        # Lower poloidal target (j = 0): corners 0 → 1  → shape (nx,)
+        fl_pol_low = _face_len(crx[:, 0, 0], cry[:, 0, 0], crx[:, 0, 1], cry[:, 0, 1])
+        self.face_len_pol_low = torch.tensor(fl_pol_low / np.mean(fl_pol_low), dtype=torch.float32)
+
+        # Upper poloidal target (j = ny-1): corners 3 → 2  → shape (nx,)
+        fl_pol_high = _face_len(crx[:, -1, 3], cry[:, -1, 3], crx[:, -1, 2], cry[:, -1, 2])
+        self.face_len_pol_high = torch.tensor(fl_pol_high / np.mean(fl_pol_high), dtype=torch.float32)
     
     def compute_thermal_energy(self,
                               te: torch.Tensor,
@@ -213,42 +238,48 @@ class EnergyConservationLoss:
                                      na: torch.Tensor,
                                      ua: torch.Tensor) -> torch.Tensor:
         """
-        Compute energy flux at domain boundary (for open domain simulation).
-        Models energy leaving through boundaries.
-        
+        Compute energy flux at domain boundary.
+
+        Integrates  n_e * T_e * |u_mean|  pointwise over the three outflow
+        surfaces (outer radial wall, lower and upper poloidal targets), weighted
+        by normalised face lengths.  Using |u| instead of u avoids cancellation
+        from bipolar parallel velocities.
+
         Args:
             te: Electron temperature (batch, nx, ny)
-            ti: Ion temperature (batch, nx, ny)
+            ti: Ion temperature (batch, nx, ny)  [unused, kept for signature]
             na: Species densities (batch, nx, ny, n_species)
             ua: Species velocities (batch, nx, ny, n_species)
-        
+
         Returns:
-            Energy flux estimate (batch,)
+            Energy flux per sample (batch,)
         """
-        # Handle channel dimension if present
         if te.dim() == 4:
             te = te.squeeze(-1)
-        if ti.dim() == 4:
-            ti = ti.squeeze(-1)
-        
-        # Extract boundary values (e.g., last row and column)
-        # Simplified: use mean boundary temperature and density
-        te_boundary_x = te[:, -1, :].mean(dim=-1)    # (batch,)
-        te_boundary_y = te[:, :, -1].mean(dim=-1)    # (batch,)
-        te_boundary = (te_boundary_x + te_boundary_y) / 2
-        
-        na_boundary_x = na[:, -1, :, :].mean(dim=(1, 2))    # mean over ny, n_species → (batch,)
-        na_boundary_y = na[:, :, -1, :].mean(dim=(1, 2))    # mean over nx, n_species → (batch,)
-        na_boundary = (na_boundary_x + na_boundary_y) / 2
-        
-        ua_boundary_x = ua[:, -1, :, :].mean(dim=(1, 2))    # mean over ny, n_species → (batch,)
-        ua_boundary_y = ua[:, :, -1, :].mean(dim=(1, 2))    # mean over nx, n_species → (batch,)
-        ua_boundary = (ua_boundary_x + ua_boundary_y) / 2
-        
-        # Energy flux ~ n * T * u (simplified model)
-        energy_flux = (na_boundary * te_boundary * ua_boundary).mean()
-        
-        return energy_flux
+
+        charges = self.charges_t.to(na.device)        # (n_species,)
+        # Electron density from quasineutrality: n_e = sum_a Z_a * n_a
+        n_e = (na * charges).sum(dim=-1)              # (batch, nx, ny)
+
+        # Mean |u| across species to avoid bipolar cancellation
+        ua_abs = ua.abs().mean(dim=-1)                # (batch, nx, ny)
+
+        # Pointwise energy flux density: n_e * T_e * |u|  (batch, nx, ny)
+        flux = n_e * te * ua_abs
+
+        # Integrate over the three outflow boundary faces
+        face_outer    = self.face_len_outer.to(ua.device)     # (ny,)
+        face_pol_low  = self.face_len_pol_low.to(ua.device)   # (nx,)
+        face_pol_high = self.face_len_pol_high.to(ua.device)  # (nx,)
+
+        # Outer radial wall (i = nx-1): sum over ny
+        flux_outer    = (flux[:, -1, :]  * face_outer.unsqueeze(0)).sum(dim=-1)    # (batch,)
+        # Lower poloidal target (j = 0): sum over nx
+        flux_pol_low  = (flux[:, :,  0]  * face_pol_low.unsqueeze(0)).sum(dim=-1)  # (batch,)
+        # Upper poloidal target (j = ny-1): sum over nx
+        flux_pol_high = (flux[:, :, -1]  * face_pol_high.unsqueeze(0)).sum(dim=-1) # (batch,)
+
+        return flux_outer + flux_pol_low + flux_pol_high
     
     def check_poloidal_periodicity(self,
                                   field: torch.Tensor,
@@ -360,37 +391,26 @@ class EnergyConservationLoss:
             # |energy_flux_true| as the denominator with a tiny clamp floor (1e-30)
             # causes division by ~0 → Inf loss → NaN gradients after clip_grad_norm_.
             flux_scale = (energy_flux_pred.detach().abs() + energy_flux_true.detach().abs()).clamp(min=1.0)
-            loss_flux = ((energy_flux_pred - energy_flux_true.detach()) / flux_scale).pow(2)
+            loss_flux = ((energy_flux_pred - energy_flux_true.detach()) / flux_scale).pow(2).mean()
         else:
-            loss_flux = energy_flux_pred.abs()
+            loss_flux = energy_flux_pred.abs().mean()
         
         losses['loss_flux'] = loss_flux
         
-        # ============== POLOIDAL CIRCULARITY CONSTRAINTS ==============
-        # Enforce periodicity along poloidal axis (y-direction)
-        # All physical fields must satisfy periodic boundary conditions 
-        
-        loss_poloidal_te = self.check_poloidal_periodicity(te_pred, method='mse')
-        loss_poloidal_ti = self.check_poloidal_periodicity(ti_pred, method='mse') if ti_pred is not None else torch.tensor(0.0, device=te_pred.device)
-        loss_poloidal_na = self.check_poloidal_periodicity(na_pred, method='mse')
-        loss_poloidal_ua = self.check_poloidal_periodicity(ua_pred, method='mse')
-        
-        # Combined poloidal periodicity loss
-        loss_poloidal_periodicity = (
-            loss_poloidal_te + 
-            (loss_poloidal_ti if isinstance(loss_poloidal_ti, torch.Tensor) else 0.0) + 
-            loss_poloidal_na + 
-            loss_poloidal_ua
-        ) / 4.0
-        
+        # Poloidal periodicity is intentionally disabled:
+        # In SOLPS divertor geometry the j-axis is RADIAL (core → wall), so
+        # j=0 (core/separatrix) and j=ny-1 (outer wall) have completely different
+        # plasma conditions and are NOT periodic.  Enforcing field[:,j=0] ≈
+        # field[:,j=-1] creates a permanent, non-minimisable penalty that injects
+        # false gradient signal and can hurt convergence of ua near boundaries.
+        loss_poloidal_periodicity = torch.tensor(0.0, device=te_pred.device)
         losses['loss_poloidal_periodicity'] = loss_poloidal_periodicity
-        
+
         # Compute total loss with weights
         loss_total = (
             self.weight_thermal * losses['loss_thermal'] +
             self.weight_kinetic * losses['loss_kinetic'] +
-            self.weight_flux * loss_flux +
-            self.weight_poloidal_periodicity * loss_poloidal_periodicity
+            self.weight_flux * loss_flux
         )
         
         losses['loss_total'] = loss_total

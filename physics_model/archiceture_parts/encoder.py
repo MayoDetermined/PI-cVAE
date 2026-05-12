@@ -40,7 +40,7 @@ class Encoder(nn.Module):
         self.fc_hidden = nn.Linear(self.flat_size, 512)
         self.fc_mu = nn.Linear(512, latent_dim)
         self.fc_logvar = nn.Linear(512, latent_dim)
-        self.relu = nn.ReLU()
+        self.act = nn.GELU()
         
         # Conditioning projection: adds c into hidden representation
         self.cond_proj = nn.Linear(cond_dim, 512)
@@ -70,11 +70,13 @@ class Encoder(nn.Module):
         
         # Flatten and pass through FC layers
         h = h.view(h.size(0), -1)
-        h = self.relu(self.fc_hidden(h))
+        h = self.fc_hidden(h)
         
-        # Add conditioning into hidden representation
+        # Add conditioning before activation so c can modulate feature selection
         if c is not None:
             h = h + self.cond_proj(c.float())
+        
+        h = self.act(h)
         
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)

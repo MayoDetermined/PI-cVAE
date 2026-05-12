@@ -39,18 +39,6 @@ class PriorNet(nn.Module):
         self.fc_mu = nn.Linear(hidden, latent_dim)
         self.fc_logvar = nn.Linear(hidden, latent_dim)
 
-    def fourier_encode(self, c: torch.Tensor) -> torch.Tensor:
-        """Apply Fourier positional encoding to conditioning."""
-        if not self.use_cond_fourier:
-            return c
-            
-        freqs = self.freqs.to(c.device)
-        encoded = [c]
-        for freq in freqs:
-            encoded.append(torch.sin(freq * c))
-            encoded.append(torch.cos(freq * c))
-        return torch.cat(encoded, dim=-1)
-
     def forward(
         self,
         c: torch.Tensor,
@@ -74,11 +62,14 @@ class PriorNet(nn.Module):
         # Forward pass through hidden layers with residual connection
         h1 = self.layer1(c_in)
         h2 = self.layer2(h1)
-        h3 = self.layer3(h2) + h1  # residual connection
+        h3 = self.layer3(h2) + h2  # residual connection (skip over layer3 only)
         
         # Compute prior distribution parameters
+        # NOTE: raw logvar (no softplus) so the prior can have variance < 1 too,
+        # matching the encoder's unconstrained logvar_q.  Numerical stability is
+        # ensured by the clamp([-10, 10]) inside compute_cvae_kl.
         mu = self.fc_mu(h3)
-        logvar = softplus_logvar(self.fc_logvar(h3))
+        logvar = self.fc_logvar(h3)
         
         return mu, logvar
  

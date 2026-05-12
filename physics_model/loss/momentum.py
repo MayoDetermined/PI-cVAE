@@ -133,24 +133,28 @@ class MomentumConservationLoss:
             self.face_len_pol_high = torch.ones(nx,       dtype=torch.float32)
             return
 
-        crx = self.data_handler.crx  # (nx, ny, 4)
-        cry = self.data_handler.cry  # (nx, ny, 4)
+        crx = self.data_handler.crx  # (nx, ny, 4)  — R [m]
+        cry = self.data_handler.cry  # (nx, ny, 4)  — Z [m]
 
         nx, ny = crx.shape[:2]
-        cell_volumes = np.zeros((nx, ny))
 
-        # Cell areas via the Shoelace formula
-        for i in range(nx):
-            for j in range(ny):
-                x = crx[i, j, :]
-                y = cry[i, j, :]
-                cell_volumes[i, j] = 0.5 * np.abs(
-                    np.sum(x * np.roll(y, 1)) - np.sum(y * np.roll(x, 1))
-                )
+        # Vectorised Shoelace formula: 2D poloidal-plane cell area [m^2]
+        x, y = crx, cry
+        cell_volumes = 0.5 * np.abs(
+            x[:, :, 0] * (y[:, :, 3] - y[:, :, 1]) +
+            x[:, :, 1] * (y[:, :, 0] - y[:, :, 2]) +
+            x[:, :, 2] * (y[:, :, 1] - y[:, :, 3]) +
+            x[:, :, 3] * (y[:, :, 2] - y[:, :, 0])
+        )
 
-        # Normalize to unit mean for numerical stability
+        # Toroidal Jacobian: dV = 2*pi*R * dA  (toroidal symmetry assumed).
+        # crx = R [m], so weight each cell by its major radius.
+        R_center = crx.mean(axis=2)  # (nx, ny)
+        cell_volumes = cell_volumes * R_center
+
+        mean_vol = cell_volumes[cell_volumes > 0].mean()
         self.cell_volumes = torch.tensor(
-            cell_volumes / np.mean(cell_volumes), dtype=torch.float32
+            cell_volumes / mean_vol, dtype=torch.float32
         )
 
         def _face_len(x0, y0, x1, y1):
@@ -387,26 +391,22 @@ class MomentumConservationLoss:
         
         losses['loss_momentum_flux'] = loss_momentum_flux
         
-        # ============== POLOIDAL CIRCULARITY CONSTRAINTS ==============
-        # Enforce periodicity for velocity and density
-        loss_poloidal_na = self.check_poloidal_periodicity(na_pred, method='mse')
-        loss_poloidal_ua = self.check_poloidal_periodicity(ua_pred, method='mse')
-        
-        loss_poloidal_periodicity = (loss_poloidal_na + loss_poloidal_ua) / 2.0
-        
+        # Poloidal periodicity is intentionally disabled:
+        # In SOLPS divertor geometry the j-axis is RADIAL (core → wall), so
+        # j=0 (core) and j=ny-1 (outer wall) are NOT periodic boundaries.
+        loss_poloidal_periodicity = torch.tensor(0.0, device=na_pred.device)
         losses['loss_poloidal_periodicity'] = loss_poloidal_periodicity
-        
+
         # ============== CHARGE-DEPENDENT EFFECTS ==============
         # Account for electromagnetic forces on ions vs neutrals
         loss_charge_effects = self.compute_charge_effects(na_pred)
-        
+
         losses['loss_charge_effects'] = loss_charge_effects
-        
+
         # ============== TOTAL LOSS ==============
         loss_total = (
             self.weight_momentum * losses['loss_momentum'] +
             self.weight_momentum_flux * loss_momentum_flux +
-            self.weight_poloidal_periodicity * loss_poloidal_periodicity +
             self.weight_charge_effects * loss_charge_effects
         )
         
