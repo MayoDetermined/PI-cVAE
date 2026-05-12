@@ -47,11 +47,12 @@ logger = logging.getLogger(__name__)
 
 class TorchDenormalizer:
     """
-    Reverses min-max (and optional log) normalization using torch operations.
+    Reverses min-max normalization using torch operations (gradient-preserving).
 
-    Supports the same fields as PlasmaDataHandler.denormalize:
-      - te, ti, na  : natural-log scale if log_min/max differ from linear
-      - ua          : linear only
+    Mirrors PlasmaDataHandler.denormalize():
+      - te, ti, na : norm_stats_minmax stores LN values in min/max → exp() after linear interp
+      - ua         : arcsinh reverse transform
+      - others     : linear only
 
     All stat arrays are cached as float32 tensors on the target device.
     """
@@ -65,34 +66,20 @@ class TorchDenormalizer:
         if key not in self._cache:
             vmin = torch.tensor(self._stats[f"{field}_min"], dtype=torch.float32, device=device)
             vmax = torch.tensor(self._stats[f"{field}_max"], dtype=torch.float32, device=device)
-
-            use_log = False
-            if f"{field}_log_min" in self._stats and f"{field}_log_max" in self._stats:
-                log_min = self._stats[f"{field}_log_min"]
-                log_max = self._stats[f"{field}_log_max"]
-                if np.any(np.abs(log_min - self._stats[f"{field}_min"]) > 1e-10) or \
-                   np.any(np.abs(log_max - self._stats[f"{field}_max"]) > 1e-10):
-                    vmin = torch.tensor(log_min, dtype=torch.float32, device=device)
-                    vmax = torch.tensor(log_max, dtype=torch.float32, device=device)
-                    use_log = True
-
-            self._cache[key] = (vmin, vmax, use_log)
+            self._cache[key] = (vmin, vmax)
         return self._cache[key]
 
     def denorm(self, field: str, x: torch.Tensor) -> torch.Tensor:
         """
         Denormalize tensor ``x`` (values should be in [0, 1]) for the given field.
 
-        ``x`` can be any shape; stat broadcast is handled automatically.
-        Includes clamping to avoid numerical overflow in exp().
-        
-        Handles:
-        - te/ti/na: exp() for log-scale fields
+        Mirrors PlasmaDataHandler.denormalize() exactly:
+        - te/ti/na: stats store LN values directly in min/max → linear interp then exp()
         - ua: arcsinh reverse transform for bipolar velocities
         - X, others: linear denormalization
         """
-        vmin, vmax, use_log = self._get(field, x.device)
-        
+        vmin, vmax = self._get(field, x.device)
+
         if field == "ua":
             # ua: reverse arcsinh transform
             scale = torch.maximum(torch.abs(vmin), torch.abs(vmax))
@@ -102,18 +89,18 @@ class TorchDenormalizer:
             data_arcsinh = x * (2.0 * asinh_max) - asinh_max
             out = scale * torch.sinh(data_arcsinh)
             return out
-        
+
         out = x * (vmax - vmin) + vmin
-        
-        if use_log:
-            # Clamp to the physical log-range [vmin, vmax] rather than a fixed
-            # numeric safe-guard: this prevents out-of-range model outputs from
-            # producing unphysical values that blow up physics losses.
+
+        if field in ("te", "ti", "na"):
+            # norm_stats_minmax.npz stores natural-log values directly in min/max
+            # (same convention as data_handler.denormalize).  Clamp before exp()
+            # to prevent float32 overflow from out-of-range model outputs.
             v_lo = float(vmin.min().item())
             v_hi = float(vmax.max().item())
             out = torch.clamp(out, min=v_lo, max=v_hi)
             out = torch.exp(out)
-        
+
         return out
 
 
