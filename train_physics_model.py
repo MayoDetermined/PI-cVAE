@@ -82,8 +82,9 @@ class TorchDenormalizer:
 
         if field == "ua":
             # ua: reverse arcsinh transform
+            # min=1.0 mirrors PlasmaDataHandler.denormalize (np.maximum(scale, 1.0))
             scale = torch.maximum(torch.abs(vmin), torch.abs(vmax))
-            scale = torch.clamp(scale, min=1e-8)
+            scale = torch.clamp(scale, min=1.0)
             asinh_max = torch.asinh(torch.tensor(1.0, dtype=torch.float32, device=x.device))
             # Reverse: [0,1] → [-asinh_max, asinh_max] → sinh → original scale
             data_arcsinh = x * (2.0 * asinh_max) - asinh_max
@@ -96,9 +97,13 @@ class TorchDenormalizer:
             # norm_stats_minmax.npz stores natural-log values directly in min/max
             # (same convention as data_handler.denormalize).  Clamp before exp()
             # to prevent float32 overflow from out-of-range model outputs.
-            v_lo = float(vmin.min().item())
-            v_hi = float(vmax.max().item())
-            out = torch.clamp(out, min=v_lo, max=v_hi)
+            # For te/ti: vmin/vmax are scalar; for na: shape (10,) — clamp per-species.
+            if vmin.numel() == 1:
+                out = torch.clamp(out, min=vmin.item(), max=vmax.item())
+            else:
+                # torch.clamp supports tensor min/max (PyTorch >= 1.9), broadcasts
+                # against the last dim of out (..., 10)
+                out = torch.clamp(out, min=vmin, max=vmax)
             out = torch.exp(out)
 
         return out
@@ -157,6 +162,9 @@ def compute_cvae_kl(model: "ConditionalVAE", mu: torch.Tensor, logvar: torch.Ten
     """
     if model.use_prior_net:
         mu_p, logvar_p = model.prior_net(cond)
+        # Clamp logvars to prevent exp() overflow / division by near-zero
+        logvar   = torch.clamp(logvar,   -10.0, 10.0)
+        logvar_p = torch.clamp(logvar_p, -10.0, 10.0)
         # KL between two diagonal Gaussians
         kl = 0.5 * (
             logvar_p - logvar
@@ -193,6 +201,11 @@ class PlasmaDataset(Dataset):
 
         # Raw arrays for this sample
         te = h.te[idx]       # (104, 50)
+        if h.ti is None:
+            raise RuntimeError(
+                "ti (ion temperature) not loaded — ti_tmp.npy missing in split directory. "
+                "This model requires all 22 channels including ti."
+            )
         ti = h.ti[idx]       # (104, 50)
         na = h.na[idx]       # (104, 50, 10)
         ua = h.ua[idx]       # (104, 50, 10)

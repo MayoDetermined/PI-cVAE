@@ -43,9 +43,14 @@ def recalc_stats(data_root: str = 'a_dataset'):
     # Compute stats
     new_stats = {}
     
-    # X: linear scale
-    new_stats['X_min'] = X.min(axis=0).astype(np.float32)
-    new_stats['X_max'] = X.max(axis=0).astype(np.float32)
+    # X: mixed scale — indices [3,4,5] (D_puff, N_puff, D_core) use log10.
+    # norm_stats convention: X_min/max store log10 values at those indices.
+    X_LOG_INDICES = [3, 4, 5]
+    X_for_stat = X.copy().astype(np.float64)
+    for idx in X_LOG_INDICES:
+        X_for_stat[:, idx] = np.log10(X[:, idx])
+    new_stats['X_min'] = X_for_stat.min(axis=0).astype(np.float32)
+    new_stats['X_max'] = X_for_stat.max(axis=0).astype(np.float32)
     logger.info(f"X: min={new_stats['X_min']}, max={new_stats['X_max']}")
     
     # te: log scale
@@ -78,7 +83,7 @@ def recalc_stats(data_root: str = 'a_dataset'):
     # Store LOG values in na_min/na_max (not linear!)
     new_stats['na_min'] = np.array(na_log_min, dtype=np.float32)
     new_stats['na_max'] = np.array(na_log_max, dtype=np.float32)
-    # Also store linear versions for reference
+    # Also store linear (original-scale) versions for reference
     na_min_linear = []
     na_max_linear = []
     for sp in range(na.shape[-1]):
@@ -86,8 +91,8 @@ def recalc_stats(data_root: str = 'a_dataset'):
         na_pos = na_sp[na_sp > 0]
         na_min_linear.append(na_pos.min())
         na_max_linear.append(na_pos.max())
-    new_stats['na_log_min'] = np.array(na_log_min, dtype=np.float32)
-    new_stats['na_log_max'] = np.array(na_log_max, dtype=np.float32)
+    new_stats['na_min_linear'] = np.array(na_min_linear, dtype=np.float32)
+    new_stats['na_max_linear'] = np.array(na_max_linear, dtype=np.float32)
     logger.info(f"na (ln): min={new_stats['na_min']}, max={new_stats['na_max']}")
     
     # ua: linear scale — use percentiles (p2, p98) instead of min/max to handle outliers
