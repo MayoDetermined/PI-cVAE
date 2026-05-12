@@ -354,7 +354,12 @@ class EnergyConservationLoss:
         energy_flux_pred = self.compute_energy_flux_boundary(te_pred, ti_pred, na_pred, ua_pred)
         if te_true is not None and na_true is not None:
             energy_flux_true = self.compute_energy_flux_boundary(te_true, ti_true, na_true, ua_true)
-            flux_scale = energy_flux_true.detach().abs().clamp(min=1e-30)
+            # Scale by sum of both magnitudes: parallel velocities at the boundary are
+            # bidirectional in tokamak geometry, so the signed mean (energy_flux_true)
+            # can be near zero even when physical fluxes are large.  Using only
+            # |energy_flux_true| as the denominator with a tiny clamp floor (1e-30)
+            # causes division by ~0 → Inf loss → NaN gradients after clip_grad_norm_.
+            flux_scale = (energy_flux_pred.detach().abs() + energy_flux_true.detach().abs()).clamp(min=1.0)
             loss_flux = ((energy_flux_pred - energy_flux_true.detach()) / flux_scale).pow(2)
         else:
             loss_flux = energy_flux_pred.abs()

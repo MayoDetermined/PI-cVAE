@@ -360,9 +360,11 @@ class MomentumConservationLoss:
         if na_true is not None and ua_true is not None:
             # Compare with ground truth
             momentum_true = self.compute_total_momentum(na_true, ua_true)
-            
-            # L2 loss on momentum matching
-            loss_momentum = F.mse_loss(momentum_pred, momentum_true)
+
+            # Relative MSE: avoid absolute-SI-unit loss (~1e20) which creates gradient
+            # magnitudes large enough to saturate clip_grad_norm_ and zero all updates.
+            momentum_scale = momentum_true.abs().mean().clamp(min=1.0).detach()
+            loss_momentum = F.mse_loss(momentum_pred / momentum_scale, momentum_true / momentum_scale)
             
             losses['loss_momentum'] = loss_momentum
         else:
