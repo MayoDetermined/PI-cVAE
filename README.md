@@ -202,11 +202,11 @@ $$
 
 ## Citation
 
-If you use this code, cite the project and the VAE references used here.
+//
 
 ## License
 
-Specify the project license here.
+//
 
 ## Status
 
