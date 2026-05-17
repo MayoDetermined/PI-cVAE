@@ -199,12 +199,22 @@ class PCVAE(nn.Module):
         self.enc_down2 = DownsampleBlock(64, 128)
         self.enc_down3 = DownsampleBlock(128, 256)
 
-        self.bottleneck_fc1 = nn.Linear(256 * 13 * 6 + COND_SIZE, 512)
+        self.skip_shapes = [(32, 104, 50), (64, 52, 25), (128, 26, 12)]
+        self.skip_sizes = [32 * 104 * 50, 64 * 52 * 25, 128 * 26 * 12]
+        self.skip_embed_sizes = [32, 64, 128]
+        total_skip_embed = sum(self.skip_embed_sizes)
+
+        self.bottleneck_fc1 = nn.Linear(256 * 13 * 6 + total_skip_embed + COND_SIZE, 512)
         self.enc_mu = nn.Linear(512, LATENT_SIZE)
         self.enc_logvar = nn.Linear(512, LATENT_SIZE)
 
         self.dec_fc1 = nn.Linear(LATENT_SIZE + COND_SIZE, 512)
         self.dec_fc2 = nn.Linear(512, 256 * 13 * 6)
+
+        self.skip_dec_fc = nn.ModuleList([
+            nn.Linear(LATENT_SIZE + COND_SIZE, s) for s in self.skip_sizes
+        ])
+        self.skip_scale = nn.Parameter(torch.tensor([0.1, 0.1, 0.1], dtype=torch.float32))
 
         self.dec_up3 = UpsampleBlock(256, 128)
         self.dec_up2 = UpsampleBlock(256, 64, output_padding=(0, 1))
@@ -224,12 +234,20 @@ class PCVAE(nn.Module):
         h = self.act(self.dec_fc1(h))
         h = self.dec_fc2(h)
         h = h.view(-1, 256, 13, 6)
+
+        skip_feats = []
+        zc = torch.cat([z, c], dim=1)
+        for i, fc in enumerate(self.skip_dec_fc):
+            s = fc(zc)
+            s = s.view(-1, *self.skip_shapes[i])
+            skip_feats.append(self.skip_scale[i] * s)
+
         h = self.dec_up3(h)
-        h = torch.cat([h, torch.zeros_like(h)], dim=1)
+        h = torch.cat([h, skip_feats[2]], dim=1)
         h = self.dec_up2(h)
-        h = torch.cat([h, torch.zeros_like(h)], dim=1)
+        h = torch.cat([h, skip_feats[1]], dim=1)
         h = self.dec_up1(h)
-        h = torch.cat([h, torch.zeros_like(h)], dim=1)
+        h = torch.cat([h, skip_feats[0]], dim=1)
         return self.dec_final(h)
 
     def encode(self, x, c):

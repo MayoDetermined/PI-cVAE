@@ -1,9 +1,9 @@
 """
 CNN-based Parameter-Conditional VAE with:
-  - Residual blocks + U-Net skip connections
+  - Residual blocks + U-Net skip connections (throught latent to prevent collaps!!)
   - GELU activation
   - Physics losses: energy, continuity, navier_stokes, geometry balance
-  - Parameters concatenated in bottleneck + decoder (weakly-conditional)
+  - Parameters concatenated in bottleneck + decoder
   - Warmup for both KLD and physics losses
 """
 
@@ -128,7 +128,7 @@ def _weighted_mse(pred, target, weight):
     w = w.expand_as(pred)
     return ((pred - target).pow(2) * w).mean() / w.mean().clamp(min=1e-40)
 
-
+# This helps to deal whith freaky gradients 
 def _metric_residual_2d(pred_r, pred_t, dx, dy, area_x, area_y):
     """Compare physical x/y gradients of a scalar or per-species field.
 
@@ -468,27 +468,39 @@ class PCVAE(nn.Module):
     def __init__(self):
         super().__init__()
         # Input: (B, 23, 104, 50)
-        
         # Encoder
         self.enc_conv0 = nn.Sequential(nn.Conv2d(23, 32, 3, padding=1), nn.GELU(), ResBlock(32))
         self.enc_down1 = DownsampleBlock(32, 64)      # (B, 64, 52, 25)
         self.enc_down2 = DownsampleBlock(64, 128)     # (B, 128, 26, 12)
         self.enc_down3 = DownsampleBlock(128, 256)    # (B, 256, 13, 6)
-        
-        # Bottleneck: flatten spatial features, then concatenate with condition
-        self.bottleneck_fc1 = nn.Linear(256 * 13 * 6 + COND_SIZE, 512)
+
+        # Bottleneck: use compact pooled skip embeddings instead of full flattened maps
+        self.skip_shapes = [(32, 104, 50), (64, 52, 25), (128, 26, 12)]
+        self.skip_sizes = [32*104*50, 64*52*25, 128*26*12]
+        self.skip_embed_sizes = [32, 64, 128]
+
+        total_skip_embed = sum(self.skip_embed_sizes)
+
+        self.bottleneck_fc1 = nn.Linear(256 * 13 * 6 + total_skip_embed + COND_SIZE, 512)
         self.enc_mu = nn.Linear(512, LATENT_SIZE)
         self.enc_logvar = nn.Linear(512, LATENT_SIZE)
-        
-        # Decoder: latent + condition → spatial (both z and c influence reconstruction)
+
+        # Decoder: latent + condition -> spatial + skip features
         self.dec_fc1 = nn.Linear(LATENT_SIZE + COND_SIZE, 512)
         self.dec_fc2 = nn.Linear(512, 256 * 13 * 6)
-        
+
+        # Skip feature decoders (skip recon from latent to prevent collaps)
+        self.skip_dec_fc = nn.ModuleList([
+            nn.Linear(LATENT_SIZE + COND_SIZE, s) for s in self.skip_sizes
+        ])
+        # Start with weaker skip contribution. model can increase it during training.
+        self.skip_scale = nn.Parameter(torch.tensor([0.1, 0.1, 0.1], dtype=torch.float32))
+
         # Upsampling
         self.dec_up3 = UpsampleBlock(256, 128)        # (B, 256, 13, 6) -> (B, 128, 26, 12)
-        self.dec_up2 = UpsampleBlock(256, 64, output_padding=(0, 1))  # (B, 256, 26, 12) 0> (B, 64, 52, 25)
-        self.dec_up1 = UpsampleBlock(128, 32)         # (B, 128, 52, 25) -> (B, 32, 104, 50)
-        
+        self.dec_up2 = UpsampleBlock(256, 64, output_padding=(0, 1))  # (B, 128+128, 26, 12) -> (B, 64, 52, 25)
+        self.dec_up1 = UpsampleBlock(128, 32)         # (B, 64+64, 52, 25) -> (B, 32, 104, 50)
+
         # Final output (after skip concat: 32+32=64 channels)
         self.dec_final = nn.Sequential(
             nn.Conv2d(64, 32, 3, padding=1),
@@ -496,25 +508,25 @@ class PCVAE(nn.Module):
             nn.Conv2d(32, 23, 3, padding=1),
             nn.Sigmoid()
         )
-        
         self.act = nn.GELU()
 
     def encode(self, x, c):
-        """Encode spatial input to latent distribution (condition-independent encoder).
-        
-        The encoder processes spatial data independently of condition c.
-        Conditioning is applied only in the bottleneck and decoder.
-        """
-        # x: (B, 23, 104, 50), c: (B, 8) [c not used in encoder]
+        """Encode spatial input to latent distribution (condition-independent encoder)."""
+        # x: (B, 23, 104, 50), c: (B, 8)
         e0 = self.enc_conv0(x)                         # (B, 32, 104, 50)
         e1 = self.enc_down1(e0)                        # (B, 64, 52, 25)
         e2 = self.enc_down2(e1)                        # (B, 128, 26, 12)
         e3 = self.enc_down3(e2)                        # (B, 256, 13, 6)
-        
-        e3_flat = e3.view(e3.shape[0], -1)             # (B, 256*13*6)
-        bottleneck = torch.cat([e3_flat, c], dim=1)    # (B, 256*13*6 + 8) [condition added here]
-        h = self.act(self.bottleneck_fc1(bottleneck))  # (B, 512)
-        
+
+        # Compact skip embeddings keep latent conditioning stable.
+        skip0 = F.adaptive_avg_pool2d(e0, output_size=1).flatten(1)
+        skip1 = F.adaptive_avg_pool2d(e1, output_size=1).flatten(1)
+        skip2 = F.adaptive_avg_pool2d(e2, output_size=1).flatten(1)
+        skips = [skip0, skip1, skip2]
+
+        e3_flat = e3.view(e3.shape[0], -1)
+        bottleneck = torch.cat([e3_flat] + skips + [c], dim=1)
+        h = self.act(self.bottleneck_fc1(bottleneck))
         mu = self.enc_mu(h)
         logvar = self.enc_logvar(h).clamp(-10, 4)
         return mu, logvar
@@ -523,23 +535,30 @@ class PCVAE(nn.Module):
         return mu + torch.randn_like(mu) * (0.5 * logvar).exp()
 
     def decode(self, z, c):
-        """Decode latent + condition to spatial output with skip connections."""
+        """Decode latent + condition to spatial output with skip connections przez latent space."""
         # z: (B, 128), c: (B, 8)
         h = torch.cat([z, c], dim=1)                   # (B, 136)
         h = self.act(self.dec_fc1(h))                  # (B, 512)
         h = self.dec_fc2(h)                            # (B, 256*13*6)
         h = h.view(-1, 256, 13, 6)                     # (B, 256, 13, 6)
-        
-        h = self.dec_up3(h)                            # (B, 128, 26, 12)
-        h = torch.cat([h, torch.zeros_like(h)], dim=1)   # (B, 256, 26, 12)
-        
-        h = self.dec_up2(h)                            # (B, 64, 52, 25)
-        h = torch.cat([h, torch.zeros_like(h)], dim=1)   # (B, 128, 52, 25)
-        
-        h = self.dec_up1(h)                            # (B, 32, 104, 50)
-        h = torch.cat([h, torch.zeros_like(h)], dim=1)   # (B, 64, 104, 50)
-        
-        h = self.dec_final(h)                          # (B, 23, 104, 50)
+
+        # skip features from latent (z, c)
+        skip_feats = []
+        zc = torch.cat([z, c], dim=1)
+        for i, fc in enumerate(self.skip_dec_fc):
+            s = fc(zc)
+            s = s.view(-1, *self.skip_shapes[i])
+            skip_feats.append(self.skip_scale[i] * s)
+
+        # U-Net style skip connections, but coded in latent space (it prevents posterior collaps)
+        # If skip connections werent coded in latent VAE would learn to extract inf from encoder (collaps)
+        h = self.dec_up3(h)                        # (B, 128, 26, 12)
+        h = torch.cat([h, skip_feats[2]], dim=1)   # (B, 256, 26, 12)
+        h = self.dec_up2(h)                        # (B, 64, 52, 25)
+        h = torch.cat([h, skip_feats[1]], dim=1)   # (B, 128, 52, 25)
+        h = self.dec_up1(h)                        # (B, 32, 104, 50)
+        h = torch.cat([h, skip_feats[0]], dim=1)   # (B, 64, 104, 50)
+        h = self.dec_final(h)                     # (B, 23, 104, 50)
         return h
 
     def forward(self, x, c):
