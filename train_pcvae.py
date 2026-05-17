@@ -39,7 +39,7 @@ print(f'Device: {device}')
 BATCH_SIZE  = 64
 LR          = 1e-3
 LATENT_SIZE = 128
-HIDDEN      = 2048
+#HIDDEN      = 2048
 BETA_KLD    = 0.01
 FREE_BITS   = 0.5
 BETA_WARMUP = 1        # KL capacity warm-up epochs

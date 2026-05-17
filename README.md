@@ -139,27 +139,68 @@ This is a **weakly-conditional VAE** where physical parameters are concatenated 
 **Input/Output:** (B, 23, 104, 50) where 23 = 1(Te) + 1(Ti) + 10(n_s) + 10(u_s) + 1(Γ_ix)  
 **Conditioning:** 8 physical parameters (R, B, P, D_puff, N_puff, D_core, D_perp, χ_perp) min-max normalized and concatenated in decoder
 
-## Physics Losses
 
-### 1. Energy Loss
-Total energy density with electron + ion thermal + kinetic terms, matched on tokamak metric:
-$$\mathcal{L}_E = \|\nabla E_{recon}\|_{weighted} - \|\nabla E_{target}\|_{weighted}\|$$
+## Physics Losses (Kary fizyczne)
 
-### 2. Continuity Loss  
-Particle flux proxy (n_s u_s) divergence in both coordinate directions:
-$$\mathcal{L}_C = \|\nabla (n u)_{recon}\|_{weighted} - \|\nabla (n u)_{target}\|_{weighted}\|$$
+Model wykorzystuje cztery główne kary fizyczne, które wymuszają zgodność rekonstrukcji z prawami fizyki plazmy. Każda z nich jest liczona na siatce geometrycznej tokamaka, z uwzględnieniem metryki i powierzchni komórek.
 
-### 3. Navier-Stokes Loss
-Momentum flux divergence with pressure (n T_i) and kinetic terms:
-$$\mathcal{L}_{NS} = \|\nabla(n u² + n T)\|_{weighted} - \nabla(...)\|_{target}$$
+### 1. Energy Loss (Kara energetyczna)
+Porównuje gęstość energii (termodynamicznej i kinetycznej) pomiędzy rekonstrukcją a danymi referencyjnymi. Różnica liczona jest pochodną przestrzenną (gradientem) i ważona powierzchnią komórek.
 
-### 4. Geometry Balance Loss
-Global cell-integrated constraints summed over all grid cells with weighting by cell area:
-$$\mathcal{L}_{gb} = \left(\frac{\|E_{int,r}\|}{E_{int,t}\|} + \frac{\|j_{int,r}\|}{j_{int,t}\|} + \frac{\|m_{int,r}\|}{m_{int,t}\|}\right) / 3$$
+```
+L_E = mean( |∇E_recon - ∇E_target| * area )
+```
+- E — gęstość energii (termodynamiczna + kinetyczna)
+- ∇ — pochodna przestrzenna liczona na siatce zakrzywionej
+- area — powierzchnia komórki (waga geometryczna)
 
-**All spatial derivatives** use physical grid metric:
-- dx, dy: center-to-center distances from curvilinear coordinates
-- area_x, area_y: averaged cell areas for flux weighting
+**Znaczenie:** Model uczy się nie tylko wartości energii, ale także poprawnych przepływów i rozkładów przestrzennych.
+
+### 2. Continuity Loss (Kara ciągłości)
+Wymusza zachowanie ciągłości cząstek (liczby cząstek nie może "znikać" ani "powstawać" w siatce). Liczona jest dywergencja strumienia cząstek n_s u_s dla każdego gatunku.
+
+```
+L_C = mean( |div(nu)_recon - div(nu)_target| * area )
+```
+- n_s — gęstość cząstek dla gatunku s
+- u_s — prędkość równoległa dla gatunku s
+- div — dywergencja (pochodna przestrzenna)
+- area — powierzchnia komórki
+
+**Znaczenie:** Model uczy się zachowywać liczbę cząstek w każdym punkcie siatki.
+
+### 3. Navier-Stokes Loss (Kara pędu)
+Wymusza zgodność z równaniem pędu (Naviera-Stokesa) — czyli poprawny przepływ pędu, uwzględniając ciśnienie i ruch.
+
+```
+L_NS = mean( |div(nu^2 + nT)_recon - div(nu^2 + nT)_target| * area )
+```
+- n — gęstość
+- u — prędkość
+- T — temperatura jonowa
+- div — dywergencja
+- area — powierzchnia komórki
+
+**Znaczenie:** Model uczy się poprawnych przepływów pędu i rozkładów ciśnienia.
+
+### 4. Geometry Balance Loss (Kara globalnej równowagi geometrycznej)
+Wymusza globalną zgodność bilansów (energia, cząstki, pęd) po całkowaniu po całej siatce, z wagą powierzchni.
+
+```
+L_gb = ( |E_int_r|/|E_int_t| + |j_int_r|/|j_int_t| + |m_int_r|/|m_int_t| ) / 3
+```
+- E_int_r — całkowita energia z rekonstrukcji
+- E_int_t — całkowita energia z danych
+- j_int_r — całkowity strumień cząstek z rekonstrukcji
+- j_int_t — całkowity strumień cząstek z danych
+- m_int_r — całkowity pęd z rekonstrukcji
+- m_int_t — całkowity pęd z danych
+
+**Znaczenie:** Model nie tylko lokalnie, ale i globalnie zachowuje prawa fizyki.
+
+**Wszystkie pochodne przestrzenne** liczone są na fizycznej siatce tokamaka:
+- dx, dy: odległości środek-środek z krzywoliniowych współrzędnych
+- area_x, area_y: uśrednione powierzchnie komórek do ważenia strumieni
 
 ## File Structure
 
