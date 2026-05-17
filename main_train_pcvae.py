@@ -128,7 +128,7 @@ def _weighted_mse(pred, target, weight):
     w = w.expand_as(pred)
     return ((pred - target).pow(2) * w).mean() / w.mean().clamp(min=1e-40)
 
-# This helps to deal whith freaky gradients 
+# This helps to deal whith freaky gradients !!
 def _metric_residual_2d(pred_r, pred_t, dx, dy, area_x, area_y):
     """Compare physical x/y gradients of a scalar or per-species field.
 
@@ -268,17 +268,22 @@ def physics_loss_energy(recon, target):
 
     mass   = _MASS.to(recon.device)
 
+    # Electron density is reconstructed from the species charges.
     n_e_r = (na_r * _CHARGE.to(recon.device)).sum(dim=-1)
     n_e_t = (na_t * _CHARGE.to(recon.device)).sum(dim=-1)
 
+    # Ion density is the total density summed over all species.
     n_i_r = na_r.sum(dim=-1)
     n_i_t = na_t.sum(dim=-1)
 
+    # Kinetic energy is computed per species and then summed.
     kin_r = 0.5 * (na_r * ua_r.pow(2) * mass).sum(dim=-1)
     kin_t = 0.5 * (na_t * ua_t.pow(2) * mass).sum(dim=-1)
 
+    # Total energy density combines thermal and kinetic parts in SI units.
     E_r = 1.5 * (n_e_r * te_r + n_i_r * ti_r) * _eV + kin_r
     E_t = 1.5 * (n_e_t * te_t + n_i_t * ti_t) * _eV + kin_t
+    # Compare physical gradients along the curvilinear mesh directions.
     return _metric_residual_2d(E_r, E_t, _DX_X, _DY_Y, _AREA_X, _AREA_Y)
 
 

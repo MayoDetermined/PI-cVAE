@@ -23,6 +23,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from main_train_pcvae import PCVAE
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -145,119 +147,6 @@ def denormalize_fields(x_flat):
     fnixap = torch.exp(fnixap_n * (_fnixap_ln_max - _fnixap_ln_min)
                        + _fnixap_ln_min).mean(dim=1)
     return te, ti, na, ua, fnixap
-
-
-# ---------------------------------------------------------------------------
-# Parameter-Conditional VAE  (must match train_PCVAE.py)
-# ---------------------------------------------------------------------------
-class ResBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        h = self.act(self.conv1(x))
-        h = self.conv2(h)
-        return x + h
-
-
-class DownsampleBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, 4, stride=2, padding=1)
-        self.res = ResBlock(out_ch)
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        x = self.act(self.conv(x))
-        x = self.res(x)
-        return x
-
-
-class UpsampleBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, output_padding=0):
-        super().__init__()
-        self.conv = nn.ConvTranspose2d(
-            in_ch, out_ch, 4, stride=2, padding=1, output_padding=output_padding
-        )
-        self.res = ResBlock(out_ch)
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        x = self.act(self.conv(x))
-        x = self.res(x)
-        return x
-
-
-class PCVAE(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.enc_conv0 = nn.Sequential(nn.Conv2d(23, 32, 3, padding=1), nn.GELU(), ResBlock(32))
-        self.enc_down1 = DownsampleBlock(32, 64)
-        self.enc_down2 = DownsampleBlock(64, 128)
-        self.enc_down3 = DownsampleBlock(128, 256)
-
-        self.skip_shapes = [(32, 104, 50), (64, 52, 25), (128, 26, 12)]
-        self.skip_sizes = [32 * 104 * 50, 64 * 52 * 25, 128 * 26 * 12]
-        self.skip_embed_sizes = [32, 64, 128]
-        total_skip_embed = sum(self.skip_embed_sizes)
-
-        self.bottleneck_fc1 = nn.Linear(256 * 13 * 6 + total_skip_embed + COND_SIZE, 512)
-        self.enc_mu = nn.Linear(512, LATENT_SIZE)
-        self.enc_logvar = nn.Linear(512, LATENT_SIZE)
-
-        self.dec_fc1 = nn.Linear(LATENT_SIZE + COND_SIZE, 512)
-        self.dec_fc2 = nn.Linear(512, 256 * 13 * 6)
-
-        self.skip_dec_fc = nn.ModuleList([
-            nn.Linear(LATENT_SIZE + COND_SIZE, s) for s in self.skip_sizes
-        ])
-        self.skip_scale = nn.Parameter(torch.tensor([0.1, 0.1, 0.1], dtype=torch.float32))
-
-        self.dec_up3 = UpsampleBlock(256, 128)
-        self.dec_up2 = UpsampleBlock(256, 64, output_padding=(0, 1))
-        self.dec_up1 = UpsampleBlock(128, 32)
-
-        self.dec_final = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, 23, 3, padding=1),
-            nn.Sigmoid()
-        )
-
-        self.act = nn.GELU()
-
-    def decode(self, z, c):
-        h = torch.cat([z, c], dim=1)
-        h = self.act(self.dec_fc1(h))
-        h = self.dec_fc2(h)
-        h = h.view(-1, 256, 13, 6)
-
-        skip_feats = []
-        zc = torch.cat([z, c], dim=1)
-        for i, fc in enumerate(self.skip_dec_fc):
-            s = fc(zc)
-            s = s.view(-1, *self.skip_shapes[i])
-            skip_feats.append(self.skip_scale[i] * s)
-
-        h = self.dec_up3(h)
-        h = torch.cat([h, skip_feats[2]], dim=1)
-        h = self.dec_up2(h)
-        h = torch.cat([h, skip_feats[1]], dim=1)
-        h = self.dec_up1(h)
-        h = torch.cat([h, skip_feats[0]], dim=1)
-        return self.dec_final(h)
-
-    def encode(self, x, c):
-        raise NotImplementedError('visualize_PCVAE only uses decode()')
-
-    def forward(self, x, c):
-        mu, logvar = self.encode(x, c)
-        z = mu + torch.randn_like(mu) * (0.5 * logvar).exp()
-        return self.decode(z, c), mu, logvar
-
 
 # ---------------------------------------------------------------------------
 # Load checkpoint

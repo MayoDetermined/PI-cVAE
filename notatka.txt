@@ -1,0 +1,17 @@
+1. Zmiany w fizycznych stratach
+
+- Zmnieniłem globalną stratę pędu na wyciągniętą z równania NS dla cieczy i teraz jest liczona na punktach siatki
+- Strata energii też jest liczona na punktach siatki i uwzględnia ładunek przy liczeniu energii termalnej
+- Strata ciągłośći porównuje strumień na punkcie siatki
+
+- Liczę straty na wartościach zdenormalizowanych ale sam MSE jest względny. Pozwala mi to na uniknięcie inf/nan i ludzie wartości strat
+
+2. Zmiana w architekturze
+
+- Zrobiłem skip connections ale nie do okoła latent spaceu a przez latent tzn skip connections jest ładowane do środka a potem odwzorowywane z sampla (nie mam na to paperu)
+Zrobiłem to, by chronić model przed collapsem, bo skip connections pozwalało na omijanie latentu a teraz jest on dodatkowo wzmocniony
+- Maksymalnie uprościłem architekturę tzn usunąłem zbędne dodatki i zostały same CNN wraz z funkcjami straty 
+
+3. Poza tym
+
+- Aktualnie testuję jeszcze architekturę z modelem dyfuzyjnym w latnet space: https://openaccess.thecvf.com/content/CVPR2022/papers/Rombach_High-Resolution_Image_Synthesis_With_Latent_Diffusion_Models_CVPR_2022_paper.pdf
