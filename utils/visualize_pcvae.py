@@ -11,6 +11,7 @@ Usage:
 """
 
 import os
+import sys
 import argparse
 import numpy as np
 import matplotlib
@@ -23,7 +24,20 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from main_train_pcvae import PCVAE
+# Ensure relative paths resolve against project root even when launched from
+# `utils/`.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if os.getcwd() != PROJECT_ROOT:
+    os.chdir(PROJECT_ROOT)
+
+try:
+    # Works when executed as a package module.
+    from ..main_train_pcvae import PCVAE
+except ImportError:
+    # Works when executed as a script: `python utils/visualize_pcvae.py`.
+    if PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, PROJECT_ROOT)
+    from main_train_pcvae import PCVAE
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -35,6 +49,8 @@ parser.add_argument('--sample',     type=int, nargs='+', default=None,
                     help='explicit test sample index/indices (overrides --n random choice)')
 parser.add_argument('--seed',       type=int, default=42)
 parser.add_argument('--k',          type=int, default=10, help='prior samples averaged per cell')
+parser.add_argument('--k_post',     type=int, default=1,
+                    help='posterior samples averaged per cell; 1 uses deterministic z=mu')
 parser.add_argument('--out_dir',    default='figs_PCVAE')
 args = parser.parse_args()
 
@@ -131,6 +147,36 @@ def normalize_X(X):
     return (X - _X_min.to(X.device)) / (_X_max.to(X.device) - _X_min.to(X.device))
 
 
+def normalize_fields(te, ti, na, ua, fnixap):
+    te_n = ((torch.log(te.clamp(min=1e-40)) - _te_ln_min) / (_te_ln_max - _te_ln_min)).view(-1, NX * NY)
+    ti_n = ((torch.log(ti.clamp(min=1e-40)) - _ti_ln_min) / (_ti_ln_max - _ti_ln_min)).view(-1, NX * NY)
+
+    na_ln = torch.log(na.clamp(min=1e-40))
+    na_n = (na_ln - _na_ln_min.to(na.device)) / (_na_ln_max.to(na.device) - _na_ln_min.to(na.device))
+    na_n = na_n.permute(0, 3, 1, 2).reshape(-1, NS * NX * NY)
+
+    ua_n = (ua - _ua_min.to(ua.device)) / (_ua_max.to(ua.device) - _ua_min.to(ua.device))
+    ua_n = ua_n.permute(0, 3, 1, 2).reshape(-1, NS * NX * NY)
+
+    fnixap_n = ((torch.log(fnixap.view(-1, 1).clamp(min=1e-40)) - _fnixap_ln_min)
+                / (_fnixap_ln_max - _fnixap_ln_min))
+    fnixap_n = fnixap_n.expand(-1, NX * NY)
+
+    return torch.cat([te_n, ti_n, na_n, ua_n, fnixap_n], dim=1)
+
+
+def pack_normalized_fields_to_spatial(x0_flat):
+    B = x0_flat.shape[0]
+    split = [NX * NY, NX * NY, NS * NX * NY, NS * NX * NY, NX * NY]
+    te_n, ti_n, na_n, ua_n, fn_n = torch.split(x0_flat, split, dim=1)
+    te_n = te_n.view(B, 1, NX, NY)
+    ti_n = ti_n.view(B, 1, NX, NY)
+    na_n = na_n.view(B, NS, NX, NY)
+    ua_n = ua_n.view(B, NS, NX, NY)
+    fn_n = fn_n.view(B, 1, NX, NY)
+    return torch.cat([te_n, ti_n, na_n, ua_n, fn_n], dim=1)
+
+
 def denormalize_fields(x_flat):
     if x_flat.dim() == 4:
         x_flat = x_flat.view(x_flat.shape[0], -1)
@@ -195,29 +241,49 @@ ua_b     = _batch(ua_all)
 fnixap_b = _batch(fnixap_all)
 
 # ---------------------------------------------------------------------------
-# Inference — average K prior samples per cell
+# Inference — prior mean + posterior (encoder) reconstructions
 # ---------------------------------------------------------------------------
 K = args.k
-print(f'Averaging K={K} prior samples …')
+K_POST = max(1, args.k_post)
+print(f'Averaging K={K} prior samples and K_post={K_POST} posterior samples …')
 
 with torch.no_grad():
     c    = normalize_X(X_b)
+    x0_b = pack_normalized_fields_to_spatial(normalize_fields(te_b, ti_b, na_b, ua_b, fnixap_b).clamp(0.0, 1.0))
+
     acc  = torch.zeros(N, 23, NX, NY, device=device)
     for _ in range(K):
         z   = torch.randn(N, LATENT_SIZE, device=device)
         acc += model.decode(z, c)
-    recon_flat = (acc / K).clamp(0.0, 1.0)         # (N, 23, NX, NY) clamped to [0,1]
+    recon_prior = (acc / K).clamp(0.0, 1.0)
 
-te_r, ti_r, na_r, ua_r, fnixap_r = denormalize_fields(recon_flat)
+    mu, logvar = model.encode(x0_b, c)
+    if K_POST == 1:
+        recon_post = model.decode(mu, c).clamp(0.0, 1.0)
+    else:
+        acc_post = torch.zeros(N, 23, NX, NY, device=device)
+        for _ in range(K_POST):
+            z_post = model.reparameterize(mu, logvar)
+            acc_post += model.decode(z_post, c)
+        recon_post = (acc_post / K_POST).clamp(0.0, 1.0)
+
+te_pr_t, ti_pr_t, na_pr_t, ua_pr_t, fnixap_pr_t = denormalize_fields(recon_prior)
+te_po_t, ti_po_t, na_po_t, ua_po_t, fnixap_po_t = denormalize_fields(recon_post)
 
 # NumPy copies
 def np_(t): return t.cpu().numpy()
 
-te_gt   = np_(te_b);       te_rc  = np_(te_r)
-ti_gt   = np_(ti_b);       ti_rc  = np_(ti_r)
-na_gt   = np_(na_b);       na_rc  = np_(na_r)      # (N, NX, NY, NS)
-ua_gt   = np_(ua_b);       ua_rc  = np_(ua_r)      # (N, NX, NY, NS)
-fn_gt   = np_(fnixap_b);   fn_rc  = np_(fnixap_r)
+te_gt   = np_(te_b)
+ti_gt   = np_(ti_b)
+na_gt   = np_(na_b)      # (N, NX, NY, NS)
+ua_gt   = np_(ua_b)      # (N, NX, NY, NS)
+fn_gt   = np_(fnixap_b)
+
+te_pr   = np_(te_pr_t);    te_po  = np_(te_po_t)
+ti_pr   = np_(ti_pr_t);    ti_po  = np_(ti_po_t)
+na_pr   = np_(na_pr_t);    na_po  = np_(na_po_t)
+ua_pr   = np_(ua_pr_t);    ua_po  = np_(ua_po_t)
+fn_pr   = np_(fnixap_pr_t); fn_po = np_(fnixap_po_t)
 
 # ---------------------------------------------------------------------------
 # Helper: save & close
@@ -235,64 +301,83 @@ def _save(fig, name):
 def rmse(a, b):  return np.sqrt(np.mean((a.astype(np.float64)-b.astype(np.float64))**2))
 def mre(a, b):   return np.mean(np.abs(a-b) / np.abs(b).clip(1e-40))
 
-print(f"\n{'Field':<14}  {'RMSE':>12}  {'Mean rel err':>14}")
-print('-' * 44)
-for name, gt, rc in [('Te [eV]', te_gt, te_rc), ('Ti [eV]', ti_gt, ti_rc)]:
-    print(f'{name:<14}  {rmse(gt, rc):>12.3f}  {mre(gt, rc):>14.4f}')
+print(f"\n{'Field':<14}  {'RMSE prior':>12}  {'RMSE post':>12}  {'MRE prior':>12}  {'MRE post':>12}")
+print('-' * 74)
+for name, gt, pr, po in [('Te [eV]', te_gt, te_pr, te_po), ('Ti [eV]', ti_gt, ti_pr, ti_po)]:
+    print(f'{name:<14}  {rmse(gt, pr):>12.3f}  {rmse(gt, po):>12.3f}  {mre(gt, pr):>12.4f}  {mre(gt, po):>12.4f}')
 for s in range(NS):
     print(f'na[{SPECIES[s]}]'.ljust(14) +
-          f'  {rmse(na_gt[...,s], na_rc[...,s]):>12.3e}'
-          f'  {mre(na_gt[...,s], na_rc[...,s]):>14.4f}')
+          f'  {rmse(na_gt[...,s], na_pr[...,s]):>12.3e}'
+          f'  {rmse(na_gt[...,s], na_po[...,s]):>12.3e}'
+          f'  {mre(na_gt[...,s], na_pr[...,s]):>12.4f}'
+          f'  {mre(na_gt[...,s], na_po[...,s]):>12.4f}')
 for s in [1, 3]:
     print(f'ua[{SPECIES[s]}]'.ljust(14) +
-          f'  {rmse(ua_gt[...,s], ua_rc[...,s]):>12.3e}'
-          f'  {mre(ua_gt[...,s], ua_rc[...,s]):>14.4f}')
+          f'  {rmse(ua_gt[...,s], ua_pr[...,s]):>12.3e}'
+          f'  {rmse(ua_gt[...,s], ua_po[...,s]):>12.3e}'
+          f'  {mre(ua_gt[...,s], ua_pr[...,s]):>12.4f}'
+          f'  {mre(ua_gt[...,s], ua_po[...,s]):>12.4f}')
 print()
 
 # ---------------------------------------------------------------------------
-# Fig 1 — Te and Ti  (GT | Recon | rel.error)
+# Fig 1 — Te and Ti  (GT | Prior | Posterior | rel.error prior | rel.error posterior)
 # ---------------------------------------------------------------------------
 print('Plotting Fig 1: Te / Ti …')
-fig, axes = plt.subplots(N, 6, figsize=(22, 3.8*N))
+fig, axes = plt.subplots(N, 10, figsize=(36, 3.8*N))
 if N == 1: axes = axes[np.newaxis, :]
-fig.suptitle(f'Te & Ti  — GT vs prior mean (K={K})', fontsize=11)
+fig.suptitle(f'Te & Ti  — GT vs prior mean (K={K}) and encoder posterior', fontsize=11)
 for i in range(N):
-    for j, (gt, rc, lbl) in enumerate([(te_gt[i], te_rc[i], '$T_e$'),
-                                        (ti_gt[i], ti_rc[i], '$T_i$')]):
-        vmin = max(min(gt.min(), rc.min()), 0.1)
-        vmax = max(gt.max(), rc.max())
-        rel  = np.abs(rc - gt) / gt.clip(1e-40)
-        plot_field(axes[i, j*3+0], gt,        vmin, vmax, title=f'GT {lbl} [eV]' if i==0 else '')
-        plot_field(axes[i, j*3+1], rc,        vmin, vmax, title=f'Recon {lbl}' if i==0 else '')
-        plot_field(axes[i, j*3+2], rel.clip(1e-4), 1e-4, rel.max().clip(1e-3),
-                   title='Rel err' if i==0 else '', cmap='hot_r')
+    for j, (gt, pr, po, lbl) in enumerate([(te_gt[i], te_pr[i], te_po[i], '$T_e$'),
+                                            (ti_gt[i], ti_pr[i], ti_po[i], '$T_i$')]):
+        vmin = max(min(gt.min(), pr.min(), po.min()), 0.1)
+        vmax = max(gt.max(), pr.max(), po.max())
+        rel_pr = np.abs(pr - gt) / gt.clip(1e-40)
+        rel_po = np.abs(po - gt) / gt.clip(1e-40)
+        rel_vmax = max(rel_pr.max(), rel_po.max(), 1e-3)
+        base = j * 5
+        plot_field(axes[i, base + 0], gt, vmin, vmax, title=f'GT {lbl} [eV]' if i == 0 else '')
+        plot_field(axes[i, base + 1], pr, vmin, vmax, title=f'Prior {lbl}' if i == 0 else '')
+        plot_field(axes[i, base + 2], po, vmin, vmax, title=f'Posterior {lbl}' if i == 0 else '')
+        plot_field(axes[i, base + 3], rel_pr.clip(1e-4), 1e-4, rel_vmax,
+                   title='Rel err prior' if i == 0 else '', cmap='hot_r')
+        plot_field(axes[i, base + 4], rel_po.clip(1e-4), 1e-4, rel_vmax,
+                   title='Rel err posterior' if i == 0 else '', cmap='hot_r')
     axes[i, 0].set_ylabel(f'#{idx[i]}', fontsize=8)
 fig.tight_layout()
 _save(fig, 'fig1_Te_Ti.png')
 
 # ---------------------------------------------------------------------------
 # Fig 2 — Total density  n_tot = Σ_s n_s  and electron density n_e = Σ Z_s n_s
+#         (GT | Prior | Posterior | rel.error prior | rel.error posterior)
 # ---------------------------------------------------------------------------
 print('Plotting Fig 2: n_tot / n_e …')
 n_tot_gt = na_gt.sum(-1)
-n_tot_rc = na_rc.sum(-1)
+n_tot_pr = na_pr.sum(-1)
+n_tot_po = na_po.sum(-1)
 Z = np.array([0, 1, 0, 1, 2, 3, 4, 5, 6, 7], dtype=np.float32)
 n_e_gt   = (na_gt * Z).sum(-1)
-n_e_rc   = (na_rc * Z).sum(-1)
+n_e_pr   = (na_pr * Z).sum(-1)
+n_e_po   = (na_po * Z).sum(-1)
 
-fig, axes = plt.subplots(N, 6, figsize=(22, 3.8*N))
+fig, axes = plt.subplots(N, 10, figsize=(36, 3.8*N))
 if N == 1: axes = axes[np.newaxis, :]
-fig.suptitle(f'Total particle density & electron density — GT vs prior mean (K={K})', fontsize=11)
+fig.suptitle('Total particle density & electron density — GT vs prior and encoder posterior', fontsize=11)
 for i in range(N):
-    for j, (gt, rc, lbl) in enumerate([(n_tot_gt[i], n_tot_rc[i], r'$n_{tot}$'),
-                                        (n_e_gt[i],   n_e_rc[i],   r'$n_e$')]):
-        vmin = max(min(gt.min(), rc.min()), 1e10)
-        vmax = max(gt.max(), rc.max())
-        rel  = np.abs(rc - gt) / gt.clip(1e-40)
-        plot_field(axes[i, j*3+0], gt,        vmin, vmax, title=f'GT {lbl} [m⁻³]' if i==0 else '')
-        plot_field(axes[i, j*3+1], rc,        vmin, vmax, title=f'Recon {lbl}' if i==0 else '')
-        plot_field(axes[i, j*3+2], rel.clip(1e-4), 1e-4, rel.max().clip(1e-3),
-                   title='Rel err' if i==0 else '', cmap='hot_r')
+    for j, (gt, pr, po, lbl) in enumerate([(n_tot_gt[i], n_tot_pr[i], n_tot_po[i], r'$n_{tot}$'),
+                                            (n_e_gt[i],   n_e_pr[i],   n_e_po[i],   r'$n_e$')]):
+        vmin = max(min(gt.min(), pr.min(), po.min()), 1e10)
+        vmax = max(gt.max(), pr.max(), po.max())
+        rel_pr = np.abs(pr - gt) / gt.clip(1e-40)
+        rel_po = np.abs(po - gt) / gt.clip(1e-40)
+        rel_vmax = max(rel_pr.max(), rel_po.max(), 1e-3)
+        base = j * 5
+        plot_field(axes[i, base + 0], gt, vmin, vmax, title=f'GT {lbl} [m⁻³]' if i == 0 else '')
+        plot_field(axes[i, base + 1], pr, vmin, vmax, title=f'Prior {lbl}' if i == 0 else '')
+        plot_field(axes[i, base + 2], po, vmin, vmax, title=f'Posterior {lbl}' if i == 0 else '')
+        plot_field(axes[i, base + 3], rel_pr.clip(1e-4), 1e-4, rel_vmax,
+                   title='Rel err prior' if i == 0 else '', cmap='hot_r')
+        plot_field(axes[i, base + 4], rel_po.clip(1e-4), 1e-4, rel_vmax,
+                   title='Rel err posterior' if i == 0 else '', cmap='hot_r')
     axes[i, 0].set_ylabel(f'#{idx[i]}', fontsize=8)
 fig.tight_layout()
 _save(fig, 'fig2_n_tot_ne.png')
@@ -306,15 +391,31 @@ for si in range(min(N, 2)):
     fig.suptitle(f'Species densities $n_s$ — sample #{idx[si]}', fontsize=11)
     for s in range(NS):
         gt_s = na_gt[si, :, :, s]
-        rc_s = na_rc[si, :, :, s]
-        vmin = max(min(gt_s.min(), rc_s.min()), 1e10)
-        vmax = max(gt_s.max(), rc_s.max())
+        pr_s = na_pr[si, :, :, s]
+        po_s = na_po[si, :, :, s]
+        vmin = max(min(gt_s.min(), pr_s.min(), po_s.min()), 1e10)
+        vmax = max(gt_s.max(), pr_s.max(), po_s.max())
         plot_field(axes[s, 0], gt_s.clip(vmin), vmin, vmax,
                    title=f'GT $n_s$ [{SPECIES[s]}]' if s==0 else f'GT [{SPECIES[s]}]')
-        plot_field(axes[s, 1], rc_s.clip(vmin), vmin, vmax,
-                   title=f'Recon [{SPECIES[s]}]' if s==0 else f'Recon [{SPECIES[s]}]')
+        plot_field(axes[s, 1], pr_s.clip(vmin), vmin, vmax,
+                   title=f'Prior [{SPECIES[s]}]' if s==0 else f'Prior [{SPECIES[s]}]')
     fig.tight_layout()
-    _save(fig, f'fig3_density_s{idx[si]}.png')
+    _save(fig, f'fig3_density_prior_s{idx[si]}.png')
+
+for si in range(min(N, 2)):
+    fig, axes = plt.subplots(NS, 2, figsize=(8, 3.5*NS))
+    fig.suptitle(f'Species densities $n_s$ (posterior) — sample #{idx[si]}', fontsize=11)
+    for s in range(NS):
+        gt_s = na_gt[si, :, :, s]
+        po_s = na_po[si, :, :, s]
+        vmin = max(min(gt_s.min(), po_s.min()), 1e10)
+        vmax = max(gt_s.max(), po_s.max())
+        plot_field(axes[s, 0], gt_s.clip(vmin), vmin, vmax,
+                   title=f'GT $n_s$ [{SPECIES[s]}]' if s==0 else f'GT [{SPECIES[s]}]')
+        plot_field(axes[s, 1], po_s.clip(vmin), vmin, vmax,
+                   title=f'Posterior [{SPECIES[s]}]' if s==0 else f'Posterior [{SPECIES[s]}]')
+    fig.tight_layout()
+    _save(fig, f'fig3_density_posterior_s{idx[si]}.png')
 
 # ---------------------------------------------------------------------------
 # Fig 4 — Velocities  (D+ and N+, first 2 samples)
@@ -322,18 +423,22 @@ for si in range(min(N, 2)):
 print('Plotting Fig 4: velocities …')
 SHOW_UA = [1, 3]  # D+, N+
 for si in range(min(N, 2)):
-    fig, axes = plt.subplots(len(SHOW_UA), 3, figsize=(12, 4.0*len(SHOW_UA)))
+    fig, axes = plt.subplots(len(SHOW_UA), 5, figsize=(19, 4.0*len(SHOW_UA)))
     if len(SHOW_UA) == 1: axes = axes[np.newaxis, :]
-    fig.suptitle(f'Velocity $u_{{||}}$ — sample #{idx[si]}', fontsize=11)
+    fig.suptitle(f'Velocity $u_{{||}}$ — sample #{idx[si]} (prior and posterior)', fontsize=11)
     for row, s in enumerate(SHOW_UA):
         gt_s = ua_gt[si, :, :, s]
-        rc_s = ua_rc[si, :, :, s]
+        pr_s = ua_pr[si, :, :, s]
+        po_s = ua_po[si, :, :, s]
         vabs = max(np.abs(gt_s).max(), 1.0)
         plot_sym(axes[row, 0], gt_s,        vabs,  title=f'GT $u_{{||}}$ [{SPECIES[s]}] m/s' if row==0 else f'GT [{SPECIES[s]}]')
-        plot_sym(axes[row, 1], rc_s,        vabs,  title=f'Recon [{SPECIES[s]}]' if row==0 else f'Recon [{SPECIES[s]}]')
-        aerr = rc_s - gt_s
-        plot_sym(axes[row, 2], aerr, np.abs(aerr).max().clip(1),
-                 title='Error [m/s]' if row==0 else '')
+        plot_sym(axes[row, 1], pr_s,        vabs,  title=f'Prior [{SPECIES[s]}]' if row==0 else f'Prior [{SPECIES[s]}]')
+        plot_sym(axes[row, 2], po_s,        vabs,  title=f'Posterior [{SPECIES[s]}]' if row==0 else f'Posterior [{SPECIES[s]}]')
+        aerr_pr = pr_s - gt_s
+        aerr_po = po_s - gt_s
+        err_abs = max(np.abs(aerr_pr).max(), np.abs(aerr_po).max(), 1.0)
+        plot_sym(axes[row, 3], aerr_pr, err_abs, title='Error prior [m/s]' if row==0 else '')
+        plot_sym(axes[row, 4], aerr_po, err_abs, title='Error posterior [m/s]' if row==0 else '')
     fig.tight_layout()
     _save(fig, f'fig4_velocity_s{idx[si]}.png')
 
@@ -381,22 +486,29 @@ def _normalize_fields_raw(te, ti, na, ua, fnixap):
 
 
 with torch.no_grad():
-    gt_flat = _normalize_fields_raw(te_b, ti_b, na_b, ua_b, fnixap_b)
-    div_gt  = ns_flux_div(gt_flat)            # (N, NX-1, NY)
-    div_rc  = ns_flux_div(recon_flat)
+    gt_flat  = _normalize_fields_raw(te_b, ti_b, na_b, ua_b, fnixap_b)
+    div_gt   = ns_flux_div(gt_flat)            # (N, NX-1, NY)
+    div_pr   = ns_flux_div(recon_prior)
+    div_po   = ns_flux_div(recon_post)
 
 # Plot on a simple rectilinear grid (NX-1 × NY pixel image)
 for si in range(min(N, 2)):
-    vabs = max(np.abs(div_gt[si]).max(), np.abs(div_rc[si]).max(), 1e-30)
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.suptitle(f'NS momentum flux divergence (norm. space) — sample #{idx[si]}', fontsize=11)
+    vabs = max(np.abs(div_gt[si]).max(), np.abs(div_pr[si]).max(), np.abs(div_po[si]).max(), 1e-30)
+    eabs = max(np.abs(div_pr[si] - div_gt[si]).max(), np.abs(div_po[si] - div_gt[si]).max(), 1e-30)
+    fig, axes = plt.subplots(1, 5, figsize=(24, 4))
+    fig.suptitle(f'NS momentum flux divergence (norm. space) — sample #{idx[si]} (prior/posterior)', fontsize=11)
     for ax, data, title in [
         (axes[0], div_gt[si], 'GT'),
-        (axes[1], div_rc[si], 'Recon (prior mean)'),
-        (axes[2], div_rc[si] - div_gt[si], 'Recon − GT'),
+        (axes[1], div_pr[si], 'Prior mean'),
+        (axes[2], div_po[si], 'Posterior'),
+        (axes[3], div_pr[si] - div_gt[si], 'Prior − GT'),
+        (axes[4], div_po[si] - div_gt[si], 'Posterior − GT'),
     ]:
-        im = ax.imshow(data.T, origin='lower', aspect='auto',
-                       vmin=-vabs, vmax=vabs, cmap='RdBu_r')
+        if 'GT' in title or 'mean' in title or title == 'Posterior':
+            vmin, vmax = -vabs, vabs
+        else:
+            vmin, vmax = -eabs, eabs
+        im = ax.imshow(data.T, origin='lower', aspect='auto', vmin=vmin, vmax=vmax, cmap='RdBu_r')
         ax.set_title(title, fontsize=9)
         ax.set_xlabel('x (radial)')
         ax.set_ylabel('y (poloidal)')
@@ -405,12 +517,18 @@ for si in range(min(N, 2)):
     _save(fig, f'fig5_ns_div_s{idx[si]}.png')
 
 # ---------------------------------------------------------------------------
-# Fig 6 — fnixap scatter (full test set)
+# Fig 6 — fnixap scatter (full test set, prior and posterior)
 # ---------------------------------------------------------------------------
 print('Plotting Fig 6: fnixap scatter (full test set) …')
 BATCH = 128
 fnixap_pred_all = np.zeros(len(fnixap_all))
+fnixap_post_all = np.zeros(len(fnixap_all))
 X_all_dev = X_all.to(device)
+te_all_dev = te_all.to(device)
+ti_all_dev = ti_all.to(device)
+na_all_dev = na_all.to(device)
+ua_all_dev = ua_all.to(device)
+fn_all_dev = fnixap_all.to(device)
 
 with torch.no_grad():
     for start in range(0, len(fnixap_all), BATCH):
@@ -423,23 +541,47 @@ with torch.no_grad():
             acc += fn
         fnixap_pred_all[sl] = (acc / K).cpu().numpy()
 
-fn_gt_all = fnixap_all.numpy()
-mask = (fn_gt_all > 0) & (fnixap_pred_all > 0)
-gt_m, pr_m = fn_gt_all[mask], fnixap_pred_all[mask]
-vmin_f = min(gt_m.min(), pr_m.min())
-vmax_f = max(gt_m.max(), pr_m.max())
-log_corr = np.corrcoef(np.log(gt_m), np.log(pr_m))[0, 1]
+        x0_b = pack_normalized_fields_to_spatial(
+            normalize_fields(te_all_dev[sl], ti_all_dev[sl], na_all_dev[sl], ua_all_dev[sl], fn_all_dev[sl]).clamp(0.0, 1.0)
+        )
+        mu_b, _ = model.encode(x0_b, c_b)
+        _, _, _, _, fn_post = denormalize_fields(model.decode(mu_b, c_b).clamp(0.0, 1.0))
+        fnixap_post_all[sl] = fn_post.cpu().numpy()
 
-fig, ax = plt.subplots(figsize=(5, 5))
-ax.scatter(gt_m, pr_m, s=4, alpha=0.4)
-ax.plot([vmin_f, vmax_f], [vmin_f, vmax_f], 'r--', lw=1, label='ideal')
-ax.set_xscale('log'); ax.set_yscale('log')
-ax.set_xlabel(r'GT $\Gamma_{\mathrm{ix}}$ [atoms/s]')
-ax.set_ylabel(f'Prior mean (K={K}) [atoms/s]')
-ax.set_title(r'Integrated D ion flux $\Gamma_{\mathrm{ix}}$')
-ax.text(0.05, 0.95, f'log-corr = {log_corr:.3f}', transform=ax.transAxes,
-        va='top', fontsize=9)
-ax.legend()
+fn_gt_all = fnixap_all.numpy()
+mask_pr = (fn_gt_all > 0) & (fnixap_pred_all > 0)
+mask_po = (fn_gt_all > 0) & (fnixap_post_all > 0)
+
+gt_pr, pr_m = fn_gt_all[mask_pr], fnixap_pred_all[mask_pr]
+gt_po, po_m = fn_gt_all[mask_po], fnixap_post_all[mask_po]
+
+vmin_f = min(gt_pr.min(), pr_m.min(), gt_po.min(), po_m.min())
+vmax_f = max(gt_pr.max(), pr_m.max(), gt_po.max(), po_m.max())
+
+log_corr_pr = np.corrcoef(np.log(gt_pr), np.log(pr_m))[0, 1]
+log_corr_po = np.corrcoef(np.log(gt_po), np.log(po_m))[0, 1]
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+axes[0].scatter(gt_pr, pr_m, s=4, alpha=0.4)
+axes[0].plot([vmin_f, vmax_f], [vmin_f, vmax_f], 'r--', lw=1, label='ideal')
+axes[0].set_xscale('log'); axes[0].set_yscale('log')
+axes[0].set_xlabel(r'GT $\Gamma_{\mathrm{ix}}$ [atoms/s]')
+axes[0].set_ylabel(f'Prior mean (K={K}) [atoms/s]')
+axes[0].set_title(r'Integrated D ion flux: prior')
+axes[0].text(0.05, 0.95, f'log-corr = {log_corr_pr:.3f}', transform=axes[0].transAxes,
+             va='top', fontsize=9)
+axes[0].legend()
+
+axes[1].scatter(gt_po, po_m, s=4, alpha=0.4)
+axes[1].plot([vmin_f, vmax_f], [vmin_f, vmax_f], 'r--', lw=1, label='ideal')
+axes[1].set_xscale('log'); axes[1].set_yscale('log')
+axes[1].set_xlabel(r'GT $\Gamma_{\mathrm{ix}}$ [atoms/s]')
+axes[1].set_ylabel('Posterior mean [atoms/s]')
+axes[1].set_title(r'Integrated D ion flux: posterior')
+axes[1].text(0.05, 0.95, f'log-corr = {log_corr_po:.3f}', transform=axes[1].transAxes,
+             va='top', fontsize=9)
+axes[1].legend()
+
 fig.tight_layout()
 _save(fig, 'fig6_fnixap.png')
 

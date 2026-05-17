@@ -21,8 +21,6 @@ import torch.utils.data
 from torch import nn, optim
 from torch.nn import functional as F
 
-from main_train_pcvae import PCVAE
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -31,7 +29,7 @@ parser.add_argument('--pcvae_checkpoint', type=str, default='train_PCVAE_results
 parser.add_argument('--results_dir', type=str, default='train_LDM_results')
 parser.add_argument('--epochs', type=int, default=120)
 parser.add_argument('--batch_size', type=int, default=64)
-parser.add_argument('--lr', type=float, default=2e-4)
+parser.add_argument('--lr', type=float, default=2e-3)
 parser.add_argument('--diff_steps', type=int, default=200)
 parser.add_argument('--beta_start', type=float, default=1e-4)
 parser.add_argument('--beta_end', type=float, default=2e-2)
@@ -42,25 +40,21 @@ parser.add_argument('--lambda_energy', type=float, default=1e-3)
 parser.add_argument('--lambda_continuity', type=float, default=1e-3)
 parser.add_argument('--lambda_navier_stokes', type=float, default=1e-3)
 parser.add_argument('--lambda_geometry_balance', type=float, default=5e-4)
+parser.add_argument('--use_unet', action='store_true', help='Use U-Net denoiser instead of MLP')
 parser.add_argument('--seed', type=int, default=42)
-args = parser.parse_args()
 
-os.makedirs(args.results_dir, exist_ok=True)
-CKPT_PATH = os.path.join(args.results_dir, 'best_latent_diffusion.pt')
 
+# Placeholder globals - will be initialized in if __name__ == '__main__'
+args = None
+device = None
+loader_kwargs = None
+train_loader = None
+test_loader = None
+CKPT_PATH = None
 
 # ---------------------------------------------------------------------------
 # Device / reproducibility
 # ---------------------------------------------------------------------------
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-loader_kwargs = {'num_workers': 0, 'pin_memory': torch.cuda.is_available()}
-
-torch.manual_seed(args.seed)
-np.random.seed(args.seed)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(args.seed)
-
-print(f'Device: {device}')
 
 
 # ---------------------------------------------------------------------------
@@ -334,11 +328,6 @@ class SimDataset(torch.utils.data.Dataset):
         return self.X[idx], self.te[idx], self.ti[idx], self.na[idx], self.ua[idx], self.fnixap[idx]
 
 
-train_loader = torch.utils.data.DataLoader(
-    SimDataset('train'), batch_size=args.batch_size, shuffle=True, **loader_kwargs)
-test_loader = torch.utils.data.DataLoader(
-    SimDataset('test'), batch_size=args.batch_size, shuffle=False, **loader_kwargs)
-
 
 # ---------------------------------------------------------------------------
 # Diffusion components
@@ -351,6 +340,152 @@ def timestep_embedding(timesteps, dim, max_period=10000):
     if dim % 2 == 1:
         emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
     return emb
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, channels, cond_dim, num_heads=4, head_dim=64):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        inner_dim = num_heads * head_dim
+        
+        self.to_q = nn.Conv2d(channels, inner_dim, 1)
+        self.to_k = nn.Linear(cond_dim, inner_dim)
+        self.to_v = nn.Linear(cond_dim, inner_dim)
+        self.to_out = nn.Conv2d(inner_dim, channels, 1)
+    
+    def forward(self, x, cond):
+        # x: (batch, channels, height, width)
+        # cond: (batch, cond_dim)
+        
+        b, c, h, w = x.shape
+        
+        # Query from feature map
+        q = self.to_q(x)  # (batch, inner_dim, h, w)
+        q = q.view(b, self.num_heads, self.head_dim, h * w).transpose(2, 3)  # (batch, heads, h*w, head_dim)
+        
+        # Key and Value from condition
+        k = self.to_k(cond)  # (batch, inner_dim)
+        v = self.to_v(cond)  # (batch, inner_dim)
+        k = k.view(b, self.num_heads, self.head_dim)  # (batch, heads, head_dim)
+        v = v.view(b, self.num_heads, self.head_dim)  # (batch, heads, head_dim)
+        
+        # Attention
+        scale = self.head_dim ** -0.5
+        sim = torch.einsum('b h n d, b h d -> b h n', q, k) * scale
+        attn = sim.softmax(dim=-1)
+
+        # Broadcast value vectors across spatial query positions and weight by attention.
+        out = attn.unsqueeze(-1) * v.unsqueeze(2)
+        out = out.transpose(2, 3).reshape(b, self.num_heads * self.head_dim, h, w)
+        
+        return self.to_out(out)
+
+
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, t_emb_ch, cond_ch):
+        super().__init__()
+        self.ln1 = nn.GroupNorm(8, in_ch)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.ln2 = nn.GroupNorm(8, out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        
+        self.time_proj = nn.Linear(t_emb_ch, out_ch)
+        self.cond_proj = nn.Linear(cond_ch, out_ch)
+        
+        self.cross_attn = CrossAttention(out_ch, cond_ch, num_heads=4)
+        
+        if in_ch != out_ch:
+            self.skip = nn.Conv2d(in_ch, out_ch, 1)
+        else:
+            self.skip = nn.Identity()
+    
+    def forward(self, x, t_emb, cond_emb):
+        h = F.gelu(self.ln1(x))
+        h = self.conv1(h)
+        
+        t_emb_proj = self.time_proj(t_emb)
+        cond_emb_proj = self.cond_proj(cond_emb)
+        
+        while t_emb_proj.dim() < h.dim():
+            t_emb_proj = t_emb_proj.unsqueeze(-1)
+        while cond_emb_proj.dim() < h.dim():
+            cond_emb_proj = cond_emb_proj.unsqueeze(-1)
+        
+        h = h + t_emb_proj + cond_emb_proj
+        
+        # Cross-attention with condition
+        h = self.cross_attn(h, cond_emb) + h
+        
+        h = F.gelu(self.ln2(h))
+        h = self.conv2(h)
+        
+        return h + self.skip(x)
+
+
+class UNetDenoiser(nn.Module):
+    def __init__(self, latent_dim=LATENT_SIZE, cond_dim=COND_SIZE, t_dim=128, hidden=256):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.t_dim = t_dim
+        
+        self.time_mlp = nn.Sequential(
+            nn.Linear(t_dim, t_dim),
+            nn.GELU(),
+            nn.Linear(t_dim, t_dim),
+        )
+        
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(cond_dim, hidden),
+            nn.GELU(),
+        )
+        
+        self.spatial_size = 4
+        self.init_channels = latent_dim // (self.spatial_size ** 2)
+        
+        self.init_conv = nn.Conv2d(self.init_channels, hidden, 3, padding=1)
+        
+        self.enc1 = ResBlock(hidden, hidden, t_dim, hidden)
+        self.down1 = nn.Conv2d(hidden, hidden * 2, 4, stride=2, padding=1)
+        
+        self.enc2 = ResBlock(hidden * 2, hidden * 2, t_dim, hidden)
+        
+        self.up1 = nn.ConvTranspose2d(hidden * 2, hidden, 4, stride=2, padding=1)
+        self.dec1 = ResBlock(hidden * 2, hidden, t_dim, hidden)
+        
+        self.final_ln = nn.GroupNorm(8, hidden)
+        self.final_conv = nn.Conv2d(hidden, self.init_channels, 3, padding=1)
+        self.final_proj = nn.Linear(latent_dim, latent_dim)
+    
+    def forward(self, z_t, t, c):
+        batch_size = z_t.shape[0]
+        
+        t_emb = timestep_embedding(t, self.t_dim)
+        t_emb = self.time_mlp(t_emb)
+        
+        c_emb = self.cond_mlp(c)
+        
+        x = z_t.view(batch_size, self.init_channels, self.spatial_size, self.spatial_size)
+        x = self.init_conv(x)
+        
+        x = self.enc1(x, t_emb, c_emb)
+        skip1 = x
+        x = self.down1(x)
+        
+        x = self.enc2(x, t_emb, c_emb)
+        
+        x = self.up1(x)
+        x = torch.cat([x, skip1], dim=1)
+        x = self.dec1(x, t_emb, c_emb)
+        
+        x = F.gelu(self.final_ln(x))
+        x = self.final_conv(x)
+        
+        x = x.view(batch_size, self.latent_dim)
+        x = self.final_proj(x)
+        
+        return x
 
 
 class LatentDenoiser(nn.Module):
@@ -386,7 +521,12 @@ class DiffusionSchedule:
     def __init__(self, num_steps, beta_start, beta_end, device):
         self.num_steps = num_steps
 
-        betas = torch.linspace(beta_start, beta_end, num_steps, dtype=torch.float32, device=device)
+        # Cosine schedule
+        t = torch.arange(num_steps, dtype=torch.float32, device=device) / num_steps
+        betas = 0.5 * (1 - torch.cos(np.pi * t))
+        betas = betas * (beta_end - beta_start) + beta_start
+        betas = betas.clamp(min=1e-4, max=0.999)
+        
         alphas = 1.0 - betas
         alpha_bars = torch.cumprod(alphas, dim=0)
         alpha_bars_prev = torch.cat([torch.ones(1, device=device), alpha_bars[:-1]], dim=0)
@@ -556,6 +696,31 @@ def load_checkpoint(path, map_location):
 
 
 if __name__ == '__main__':
+    args = parser.parse_args()
+    
+    # Setup directories
+    os.makedirs(args.results_dir, exist_ok=True)
+    CKPT_PATH = os.path.join(args.results_dir, 'best_latent_diffusion.pt')
+    
+    # Device / reproducibility
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    loader_kwargs = {'num_workers': 0, 'pin_memory': torch.cuda.is_available()}
+    
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    
+    print(f'Device: {device}')
+    
+    # Create data loaders
+    train_loader = torch.utils.data.DataLoader(
+        SimDataset('train'), batch_size=args.batch_size, shuffle=True, **loader_kwargs)
+    test_loader = torch.utils.data.DataLoader(
+        SimDataset('test'), batch_size=args.batch_size, shuffle=False, **loader_kwargs)
+    
+    from main_train_pcvae import PCVAE
+    
     vae_ckpt = load_checkpoint(args.pcvae_checkpoint, device)
 
     vae = PCVAE().to(device)
@@ -565,7 +730,7 @@ if __name__ == '__main__':
     for p in vae.parameters():
         p.requires_grad = False
 
-    denoiser = LatentDenoiser().to(device)
+    denoiser = UNetDenoiser().to(device) if args.use_unet else LatentDenoiser().to(device)
     schedule = DiffusionSchedule(
         num_steps=args.diff_steps,
         beta_start=args.beta_start,
@@ -580,6 +745,7 @@ if __name__ == '__main__':
 
     print(f"Loaded PCVAE checkpoint: {args.pcvae_checkpoint}")
     print(f"Training latent diffusion in z-space ({LATENT_SIZE}D), source={args.latent_source}")
+    print(f"Denoiser: {'U-Net' if args.use_unet else 'MLP'}")
     print(
         'Physics weights: '
         f"E={args.lambda_energy}, cont={args.lambda_continuity}, "

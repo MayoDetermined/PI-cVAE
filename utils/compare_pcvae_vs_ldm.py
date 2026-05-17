@@ -27,8 +27,24 @@ from matplotlib.collections import PatchCollection
 import torch
 from torch import nn
 
-from experimental_train_latent_diffusion_pcvae import DiffusionSchedule, LatentDenoiser
-from main_train_pcvae import PCVAE
+import sys
+
+# Ensure all relative paths (including inside imported training modules)
+# resolve against the project root when launched from `utils/`.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if os.getcwd() != PROJECT_ROOT:
+    os.chdir(PROJECT_ROOT)
+
+try:
+    # Works when executed as a package module.
+    from ..main_train_pcvae import PCVAE
+    from ..experimental_train_latent_diffusion_pcvae import LatentDenoiser, DiffusionSchedule, UNetDenoiser
+except ImportError:
+    # Works when executed as a script: `python utils/visualize_pcvae.py`.
+    if PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, PROJECT_ROOT)
+    from main_train_pcvae import PCVAE
+    from experimental_train_latent_diffusion_pcvae import LatentDenoiser, DiffusionSchedule, UNetDenoiser
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -259,7 +275,7 @@ if __name__ == '__main__':
     for p in vae.parameters():
         p.requires_grad = False
 
-    denoiser = LatentDenoiser().to(device)
+    denoiser = UNetDenoiser().to(device)
     denoiser.load_state_dict(ldm_ckpt['denoiser_state_dict'])
     denoiser.eval()
 

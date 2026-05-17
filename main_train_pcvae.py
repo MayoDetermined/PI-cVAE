@@ -18,14 +18,20 @@ from torch.nn import functional as F
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+# Only parse args if running as main script (not as imported module)
 parser = argparse.ArgumentParser()
 parser.add_argument('--epochs',      type=int, default=150)
 parser.add_argument('--results_dir', type=str, default='train_PCVAE_results')
-args = parser.parse_args()
 
-os.makedirs(args.results_dir, exist_ok=True)
-CKPT_PATH = os.path.join(args.results_dir, 'best_PCVAE.pt')
-
+if __name__ == '__main__':
+    args = parser.parse_args()
+    os.makedirs(args.results_dir, exist_ok=True)
+    CKPT_PATH = os.path.join(args.results_dir, 'best_PCVAE.pt')
+else:
+    # Default values when imported as module
+    args = None
+    CKPT_PATH = os.path.join('train_PCVAE_results', 'best_PCVAE.pt')
 # ---------------------------------------------------------------------------
 # Device
 # ---------------------------------------------------------------------------
