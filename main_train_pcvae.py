@@ -25,6 +25,21 @@ parser.add_argument('--epochs',      type=int, default=150)
 parser.add_argument('--results_dir', type=str, default='train_PCVAE_results')
 parser.add_argument('--eval_temperature', type=float, default=0.85,
                     help='Posterior latent sampling temperature used during evaluation.')
+parser.add_argument('--kl_schedule', type=str, default='linear',
+                    choices=['linear', 'cyclic', 'sigmoid', 'none'],
+                    help='KL annealing schedule: linear, cyclic, sigmoid, or none.')
+parser.add_argument('--kl_cycles', type=int, default=1,
+                    help='Number of cycles for cyclic KL annealing (only for "cyclic").')
+parser.add_argument('--kl_warmup', type=int, default=20,
+                    help='KL warm-up epochs (per cycle for cyclic schedule).')
+parser.add_argument('--beta_kld', type=float, default=3e-6,
+                    help='Base KL coefficient (BETA_KLD).')
+parser.add_argument('--kld_capacity_max', type=float, default=3.0,
+                    help='Maximum KLD capacity used with warmup scaling.')
+parser.add_argument('--resume', action='store_true',
+                    help='Resume training from checkpoint.')
+parser.add_argument('--ckpt', type=str, default='',
+                    help='Path to checkpoint to resume from (overrides default).')
 
 if __name__ == '__main__':
     args = parser.parse_args()
@@ -50,11 +65,60 @@ LATENT_SIZE = 128
 #HIDDEN      = 2048
 BETA_KLD    = 3e-6
 FREE_BITS   = 0.5
-KL_WARMUP   = 20       # KL warm-up epochs
-KLD_CAPACITY_MAX = 3.0
+KL_WARMUP   = 1       # KL warm-up epochs
+KLD_CAPACITY_MAX = 6.0
 PHYS_WARMUP = 30        # physics losses warm-up epochs
 N_EVAL      = 5         # generated samples per test point
 DEFAULT_EVAL_TEMPERATURE = 0.85
+
+# KL annealing defaults (can be overridden via CLI args)
+KL_SCHEDULE = 'linear'   # one of: 'linear', 'cyclic', 'sigmoid', 'none'
+KL_CYCLES = 1
+
+
+def get_kl_beta(epoch, total_epochs=None, schedule=None, warmup=None, cycles=None):
+    """Return KL annealing multiplier in [0,1] for given epoch.
+
+    Supports schedules: 'linear', 'cyclic', 'sigmoid', 'none'.
+    If ``total_epochs`` is None it will use `args.epochs` when available.
+    """
+    if schedule is None:
+        schedule = KL_SCHEDULE
+    if warmup is None:
+        warmup = KL_WARMUP
+    if cycles is None:
+        cycles = KL_CYCLES
+    if total_epochs is None and args is not None:
+        total_epochs = getattr(args, 'epochs', None)
+
+    e = float(epoch)
+    # No annealing: full weight
+    if schedule == 'none':
+        return 1.0
+
+    # Linear warmup to 1.0 over `warmup` epochs
+    if schedule == 'linear':
+        return min(1.0, e / max(1.0, float(warmup)))
+
+    # Sigmoid-shaped warmup (smooth ramp)
+    if schedule == 'sigmoid':
+        if e >= warmup:
+            return 1.0
+        x = (e / max(1.0, float(warmup)) - 0.5) * 12.0
+        return float(1.0 / (1.0 + math.exp(-x)))
+
+    # Cyclical annealing: repeat linear ramps `cycles` times across total_epochs
+    if schedule == 'cyclic':
+        cycles = max(1, int(cycles))
+        if total_epochs:
+            cycle_len = max(1, int(total_epochs) // cycles)
+        else:
+            cycle_len = max(1, int(warmup))
+        pos = (int(epoch) - 1) % cycle_len
+        return min(1.0, pos / max(1.0, float(warmup)))
+
+    # Fallback to linear
+    return min(1.0, e / max(1.0, float(warmup)))
 
 NX, NY, NS  = 104, 50, 10
 FIELD_SIZE  = (2 + 2*NS) * NX * NY + 1
@@ -612,8 +676,8 @@ def train_epoch(model, optimizer, epoch):
     total = 0.0
     # Linearly anneal physics loss weight over PHYS_WARMUP epochs
     beta_phys = min(1.0, epoch / PHYS_WARMUP)
-    # Warm-up KL pressure and KL capacity target to reduce posterior collapse.
-    beta_kl = min(1.0, epoch / max(1, KL_WARMUP))
+    # Warm-up / anneal KL pressure and KL capacity target to reduce posterior collapse.
+    beta_kl = get_kl_beta(epoch)
     kl_capacity = KLD_CAPACITY_MAX * beta_kl
     # Progress bar for batch iteration
     pbar = tqdm(train_loader, desc='train', leave=False, unit='batch')
@@ -660,6 +724,7 @@ def train_epoch(model, optimizer, epoch):
             mse=f'{mse.item():.4f}',
             kld=f'{kld.item():.3f}',
             kld_obj=f'{kld_obj.item():.3f}',
+            beta_kl=f'{beta_kl:.3f}',
             E=f'{e.item():.3f}',
             cont=f'{cont.item():.3f}',
             ns=f'{ns.item():.3f}',
@@ -731,11 +796,41 @@ if __name__ == '__main__':
     # with minimum learning rate eta_min=1e-6
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-    # Initialize best validation MSE to infinity for tracking best model checkpoint
+    # Override KL-related globals with CLI args when present
+    # These assignments update module-level defaults so helper and train loop use them.
+    BETA_KLD = args.beta_kld if hasattr(args, 'beta_kld') else BETA_KLD
+    KL_WARMUP = args.kl_warmup if hasattr(args, 'kl_warmup') else KL_WARMUP
+    KLD_CAPACITY_MAX = args.kld_capacity_max if hasattr(args, 'kld_capacity_max') else KLD_CAPACITY_MAX
+    KL_SCHEDULE = args.kl_schedule if hasattr(args, 'kl_schedule') else KL_SCHEDULE
+    KL_CYCLES = args.kl_cycles if hasattr(args, 'kl_cycles') else KL_CYCLES
+
+    # Optionally resume from checkpoint
+    start_epoch = 1
     best_val = float('inf')
+    if args is not None and getattr(args, 'resume', False):
+        ckpt_to_load = args.ckpt if getattr(args, 'ckpt', '') else CKPT_PATH
+        if os.path.isfile(ckpt_to_load):
+            checkpoint = torch.load(ckpt_to_load, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'scheduler_state_dict' in checkpoint:
+                try:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                except Exception as ex:
+                    print(f'Warning: failed to load scheduler state: {ex}')
+            # Move optimizer tensors to the correct device (if necessary)
+            for state in optimizer.state.values():
+                for k, v in list(state.items()):
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_val = checkpoint.get('best_val', checkpoint.get('val_mse', float('inf')))
+            print(f'Resuming from checkpoint {ckpt_to_load} (epoch {start_epoch-1})')
+        else:
+            print(f'Checkpoint {ckpt_to_load} not found — starting from scratch.')
     
-    # Create progress bar for training epochs
-    epoch_bar = tqdm(range(1, args.epochs + 1), desc='PCVAE', unit='ep')
+    # Create progress bar for training epochs (start from resumed epoch if any)
+    epoch_bar = tqdm(range(start_epoch, args.epochs + 1), desc='PCVAE', unit='ep')
     
     # Main training loop over all epochs
     for epoch in epoch_bar:
@@ -756,11 +851,13 @@ if __name__ == '__main__':
         if val_mse < best_val:
             # Update best validation MSE
             best_val = val_mse
-            
-            # Save model checkpoint with epoch number, validation MSE, model state and optimizer state
-            torch.save({'epoch': epoch, 'val_mse': val_mse,
+            # Save model checkpoint with epoch number, validation MSE, model/optimizer/scheduler states
+            torch.save({'epoch': epoch,
+                        'val_mse': val_mse,
+                        'best_val': best_val,
                         'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict()},
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict()},
                        CKPT_PATH)
             
             # Log best checkpoint save message
