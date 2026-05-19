@@ -1,0 +1,215 @@
+{
+  "started_at": "2026-05-18T20:14:06.204917",
+  "config": {
+    "epochs": 150,
+    "batch_size": 64,
+    "learning_rate": 0.001,
+    "latent_size": 128,
+    "beta_kld": 0.1,
+    "free_bits": 0.01,
+    "beta_warmup": 1,
+    "kld_capacity_max": 3.0,
+    "phys_warmup": 30,
+    "lambda_recon": 1.0,
+    "lambda_energy": 0.001,
+    "lambda_continuity": 0.001,
+    "lambda_navier_stokes": 0.001,
+    "lambda_geometry_balance": 0.0005,
+    "ema_phys_decay": 0.98,
+    "ema_phys_min_scale": 1e-06,
+    "ema_phys_max_scale": 1000000000000.0,
+    "device": "cuda"
+  },
+  "epochs_history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.028314336702030842,
+      "val_mse": 0.03293916343014827,
+      "learning_rate": 0.0009998904513956854,
+      "train_metrics": {
+        "avg_loss": 0.028314336702030842,
+        "avg_mse": 0.03729273970756266,
+        "kld": {
+          "raw_sum": 16.70565857818971,
+          "with_free_bits": 17.734334868854948,
+          "raw_mean_per_dim": 0.13051295229363152,
+          "free_bits_mean_per_dim": 0.13854948551290566,
+          "active_dims_ratio": 0.11204562717013888,
+          "beta_kld": 0.1,
+          "free_bits_threshold": 0.01
+        },
+        "avg_energy": 5.095326015270419,
+        "avg_continuity": 195450730.13333333,
+        "avg_navier_stokes": 130.48040367559426,
+        "avg_geometry_balance": 43203884.04444444,
+        "avg_energy_norm": 1.9926924443751988,
+        "avg_continuity_norm": 0.9907688041528065,
+        "avg_navier_stokes_norm": 0.6351170437093565,
+        "avg_geometry_balance_norm": 0.736042089594735,
+        "ema_scales": {
+          "energy": 2.882256475260923,
+          "continuity": 197266671.62436327,
+          "navier_stokes": 106.96915606846922,
+          "geometry_balance": 59319990.685345106,
+          "decay": 0.98,
+          "min_scale": 1e-06,
+          "max_scale": 1000000000000.0
+        },
+        "beta_phys": 0.03333333333333333
+      },
+      "is_best": true
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.0025619209884478866,
+      "val_mse": 0.03327822207771639,
+      "learning_rate": 0.00099956185363438,
+      "train_metrics": {
+        "avg_loss": 0.0025619209884478866,
+        "avg_mse": 0.03320871577080753,
+        "kld": {
+          "raw_sum": 0.11097730505797598,
+          "with_free_bits": 1.304823837015364,
+          "raw_mean_per_dim": 0.0008670101765245716,
+          "free_bits_mean_per_dim": 0.010193936205986473,
+          "active_dims_ratio": 0.015677897135416667,
+          "beta_kld": 0.1,
+          "free_bits_threshold": 0.01
+        },
+        "avg_energy": 2.5595285131078627,
+        "avg_continuity": 194172833.95555556,
+        "avg_navier_stokes": 2.1383578825328087,
+        "avg_geometry_balance": 39082872.28888889,
+        "avg_energy_norm": 0.7653845439354579,
+        "avg_continuity_norm": 0.9984682917594909,
+        "avg_navier_stokes_norm": 0.15652769568065802,
+        "avg_geometry_balance_norm": 0.8983869436714385,
+        "ema_scales": {
+          "energy": 3.3034284566120795,
+          "continuity": 194471127.9325085,
+          "navier_stokes": 20.616550003676654,
+          "geometry_balance": 43479286.84555258,
+          "decay": 0.98,
+          "min_scale": 1e-06,
+          "max_scale": 1000000000000.0
+        },
+        "beta_phys": 0.06666666666666667
+      },
+      "is_best": false
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.0025106367368388292,
+      "val_mse": 0.03227114246721153,
+      "learning_rate": 0.0009990143508499217,
+      "train_metrics": {
+        "avg_loss": 0.0025106367368388292,
+        "avg_mse": 0.032326789986756116,
+        "kld": {
+          "raw_sum": 0.058366680641969045,
+          "with_free_bits": 1.2806105918354458,
+          "raw_mean_per_dim": 0.0004559896860478653,
+          "free_bits_mean_per_dim": 0.010004770238366392,
+          "active_dims_ratio": 0.0014431423611111112,
+          "beta_kld": 0.1,
+          "free_bits_threshold": 0.01
+        },
+        "avg_energy": 0.7934175465669897,
+        "avg_continuity": 194297108.26666668,
+        "avg_navier_stokes": 0.26320194370216793,
+        "avg_geometry_balance": 29141359.277777776,
+        "avg_energy_norm": 0.32022887245855397,
+        "avg_continuity_norm": 0.9989876369635264,
+        "avg_navier_stokes_norm": 0.060860703740682864,
+        "avg_geometry_balance_norm": 0.8660300377342436,
+        "ema_scales": {
+          "energy": 1.8472757009837288,
+          "continuity": 194493843.26618022,
+          "navier_stokes": 4.4290468115806005,
+          "geometry_balance": 33827018.016812876,
+          "decay": 0.98,
+          "min_scale": 1e-06,
+          "max_scale": 1000000000000.0
+        },
+        "beta_phys": 0.1
+      },
+      "is_best": true
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.0026928084547151866,
+      "val_mse": 0.032318974207968545,
+      "learning_rate": 0.0009982481831951274,
+      "train_metrics": {
+        "avg_loss": 0.0026928084547151866,
+        "avg_mse": 0.03256209302279684,
+        "kld": {
+          "raw_sum": 0.2636749241087172,
+          "with_free_bits": 1.39377933078342,
+          "raw_mean_per_dim": 0.0020599603332811965,
+          "free_bits_mean_per_dim": 0.010888901042441527,
+          "active_dims_ratio": 0.03920220269097222,
+          "beta_kld": 0.1,
+          "free_bits_threshold": 0.01
+        },
+        "avg_energy": 0.16731095583074623,
+        "avg_continuity": 194394197.5111111,
+        "avg_navier_stokes": 0.21862347088754178,
+        "avg_geometry_balance": 41244909.244444445,
+        "avg_energy_norm": 0.33364884278012646,
+        "avg_continuity_norm": 0.9998305651876661,
+        "avg_navier_stokes_norm": 0.20609967244995964,
+        "avg_geometry_balance_norm": 1.1212252110242844,
+        "ema_scales": {
+          "energy": 0.4851315726603182,
+          "continuity": 194427039.2149631,
+          "navier_stokes": 0.9225284740479026,
+          "geometry_balance": 36989339.53460884,
+          "decay": 0.98,
+          "min_scale": 1e-06,
+          "max_scale": 1000000000000.0
+        },
+        "beta_phys": 0.13333333333333333
+      },
+      "is_best": false
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.002519529152343139,
+      "val_mse": 0.032560252213008095,
+      "learning_rate": 0.0009972636867364526,
+      "train_metrics": {
+        "avg_loss": 0.002519529152343139,
+        "avg_mse": 0.032702523180180125,
+        "kld": {
+          "raw_sum": 0.039836142046584026,
+          "with_free_bits": 1.28001596265369,
+          "raw_mean_per_dim": 0.0003112198574753064,
+          "free_bits_mean_per_dim": 0.010000124697883923,
+          "active_dims_ratio": 3.7977430555555556e-05,
+          "beta_kld": 0.1,
+          "free_bits_threshold": 0.01
+        },
+        "avg_energy": 0.18959894724604157,
+        "avg_continuity": 193598242.13333333,
+        "avg_navier_stokes": 0.11089523173868657,
+        "avg_geometry_balance": 42842749.06666667,
+        "avg_energy_norm": 0.6260267711348004,
+        "avg_continuity_norm": 0.9987095759974586,
+        "avg_navier_stokes_norm": 0.43499284668101207,
+        "avg_geometry_balance_norm": 1.085630832778083,
+        "ema_scales": {
+          "energy": 0.24697145530880518,
+          "continuity": 193848407.71171582,
+          "navier_stokes": 0.2506910492712876,
+          "geometry_balance": 39157330.23165914,
+          "decay": 0.98,
+          "min_scale": 1e-06,
+          "max_scale": 1000000000000.0
+        },
+        "beta_phys": 0.16666666666666666
+      },
+      "is_best": false
+    }
+  ]
+}

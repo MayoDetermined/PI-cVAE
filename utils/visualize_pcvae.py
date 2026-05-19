@@ -14,6 +14,8 @@ import os
 import sys
 import argparse
 import numpy as np
+import json
+from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -24,6 +26,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from tqdm import tqdm
+
 # Ensure relative paths resolve against project root even when launched from
 # `utils/`.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,12 +36,16 @@ if os.getcwd() != PROJECT_ROOT:
 
 try:
     # Works when executed as a package module.
-    from ..main_train_pcvae import PCVAE
+    from ..main_train_pcvae import (PCVAE, normalize_X, normalize_fields,
+                                   denormalize_fields, prepare_batch,
+                                   NX, NY, NS)
 except ImportError:
     # Works when executed as a script: `python utils/visualize_pcvae.py`.
     if PROJECT_ROOT not in sys.path:
         sys.path.insert(0, PROJECT_ROOT)
-    from main_train_pcvae import PCVAE
+    from main_train_pcvae import (PCVAE, normalize_X, normalize_fields,
+                                 denormalize_fields, prepare_batch,
+                                 NX, NY, NS)
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -52,6 +60,10 @@ parser.add_argument('--k',          type=int, default=10, help='prior samples av
 parser.add_argument('--k_post',     type=int, default=1,
                     help='posterior samples averaged per cell; 1 uses deterministic z=mu')
 parser.add_argument('--out_dir',    default='figs_PCVAE')
+parser.add_argument('--run_diag', action='store_true', default=False,
+                    help='Run latent diagnostics over the full test set and save outputs to out_dir')
+parser.add_argument('--diag_batch', type=int, default=64,
+                    help='Batch size used when collecting latent statistics for diagnostics')
 args = parser.parse_args()
 
 os.makedirs(args.out_dir, exist_ok=True)
@@ -59,14 +71,8 @@ rng = np.random.default_rng(args.seed)
 torch.manual_seed(args.seed)
 
 # ---------------------------------------------------------------------------
-# Grid / model constants (must match train_PCVAE.py)
+# Species labels (visualisation-only)
 # ---------------------------------------------------------------------------
-NX, NY, NS   = 104, 50, 10
-LATENT_SIZE  = 128
-COND_SIZE    = 8
-HIDDEN       = 2048
-FIELD_SIZE   = (2 + 2 * NS) * NX * NY + 1
-
 SPECIES = ['D0', 'D+', 'N0', 'N+', 'N²⁺', 'N³⁺', 'N⁴⁺', 'N⁵⁺', 'N⁶⁺', 'N⁷⁺']
 
 # ---------------------------------------------------------------------------
@@ -143,62 +149,19 @@ _M_N    = 14.0 * 1.67262192e-27
 _MASS   = torch.tensor([_M_D]*2 + [_M_N]*8, dtype=torch.float32)
 
 
-def normalize_X(X):
-    return (X - _X_min.to(X.device)) / (_X_max.to(X.device) - _X_min.to(X.device))
-
-
-def normalize_fields(te, ti, na, ua, fnixap):
-    te_n = ((torch.log(te.clamp(min=1e-40)) - _te_ln_min) / (_te_ln_max - _te_ln_min)).view(-1, NX * NY)
-    ti_n = ((torch.log(ti.clamp(min=1e-40)) - _ti_ln_min) / (_ti_ln_max - _ti_ln_min)).view(-1, NX * NY)
-
-    na_ln = torch.log(na.clamp(min=1e-40))
-    na_n = (na_ln - _na_ln_min.to(na.device)) / (_na_ln_max.to(na.device) - _na_ln_min.to(na.device))
-    na_n = na_n.permute(0, 3, 1, 2).reshape(-1, NS * NX * NY)
-
-    ua_n = (ua - _ua_min.to(ua.device)) / (_ua_max.to(ua.device) - _ua_min.to(ua.device))
-    ua_n = ua_n.permute(0, 3, 1, 2).reshape(-1, NS * NX * NY)
-
-    fnixap_n = ((torch.log(fnixap.view(-1, 1).clamp(min=1e-40)) - _fnixap_ln_min)
-                / (_fnixap_ln_max - _fnixap_ln_min))
-    fnixap_n = fnixap_n.expand(-1, NX * NY)
-
-    return torch.cat([te_n, ti_n, na_n, ua_n, fnixap_n], dim=1)
-
-
-def pack_normalized_fields_to_spatial(x0_flat):
-    B = x0_flat.shape[0]
-    split = [NX * NY, NX * NY, NS * NX * NY, NS * NX * NY, NX * NY]
-    te_n, ti_n, na_n, ua_n, fn_n = torch.split(x0_flat, split, dim=1)
-    te_n = te_n.view(B, 1, NX, NY)
-    ti_n = ti_n.view(B, 1, NX, NY)
-    na_n = na_n.view(B, NS, NX, NY)
-    ua_n = ua_n.view(B, NS, NX, NY)
-    fn_n = fn_n.view(B, 1, NX, NY)
-    return torch.cat([te_n, ti_n, na_n, ua_n, fn_n], dim=1)
-
-
-def denormalize_fields(x_flat):
-    if x_flat.dim() == 4:
-        x_flat = x_flat.view(x_flat.shape[0], -1)
-    split = [NX*NY, NX*NY, NS*NX*NY, NS*NX*NY, NX*NY]
-    te_n, ti_n, na_n, ua_n, fnixap_n = torch.split(x_flat, split, dim=1)
-    te = torch.exp(te_n * (_te_ln_max - _te_ln_min) + _te_ln_min).view(-1, NX, NY)
-    ti = torch.exp(ti_n * (_ti_ln_max - _ti_ln_min) + _ti_ln_min).view(-1, NX, NY)
-    na = torch.exp(na_n.view(-1, NS, NX, NY).permute(0,2,3,1)
-                   * (_na_ln_max.to(x_flat.device) - _na_ln_min.to(x_flat.device))
-                   + _na_ln_min.to(x_flat.device))
-    ua = (ua_n.view(-1, NS, NX, NY).permute(0,2,3,1)
-          * (_ua_max.to(x_flat.device) - _ua_min.to(x_flat.device))
-          + _ua_min.to(x_flat.device))
-    fnixap = torch.exp(fnixap_n * (_fnixap_ln_max - _fnixap_ln_min)
-                       + _fnixap_ln_min).mean(dim=1)
-    return te, ti, na, ua, fnixap
+# Normalisation and data utilities are imported from the training script
+# `main_train_pcvae.py` (see imports above).
 
 # ---------------------------------------------------------------------------
 # Load checkpoint
 # ---------------------------------------------------------------------------
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-ckpt   = torch.load(args.checkpoint, map_location=device, weights_only=True)
+# Load checkpoint onto CPU first to avoid possible zip/miniz or device mapping errors
+try:
+    ckpt = torch.load(args.checkpoint, map_location='cpu')
+except Exception:
+    # Fallback to previous behavior (map to selected device) if CPU-load fails
+    ckpt = torch.load(args.checkpoint, map_location=device)
 
 model = PCVAE().to(device)
 model.load_state_dict(ckpt['model_state_dict'])
@@ -240,6 +203,143 @@ na_b     = _batch(na_all)
 ua_b     = _batch(ua_all)
 fnixap_b = _batch(fnixap_all)
 
+
+# ---------------------------------------------------------------------------
+# Diagnostics: collect latent mu/logvar for q(z|x) and c(z|y), compute KL
+# ---------------------------------------------------------------------------
+def _prepare_batch_local(batch, device_local):
+    """Local version of prepare_batch that ensures tensors are on provided device."""
+    X, te, ti, na, ua, fnixap = [t.to(device_local) for t in batch]
+    c  = normalize_X(X)
+    x0_flat = normalize_fields(te, ti, na, ua, fnixap).clamp(0.0, 1.0)
+    B = x0_flat.shape[0]
+    split = [NX*NY, NX*NY, NS*NX*NY, NS*NX*NY, NX*NY]
+    te_n, ti_n, na_n, ua_n, fn_n = torch.split(x0_flat, split, dim=1)
+    te_n = te_n.view(B, 1, NX, NY)
+    ti_n = ti_n.view(B, 1, NX, NY)
+    na_n = na_n.view(B, NS, NX, NY)
+    ua_n = ua_n.view(B, NS, NX, NY)
+    fn_n = fn_n.view(B, 1, NX, NY)
+    x0 = torch.cat([te_n, ti_n, na_n, ua_n, fn_n], dim=1)
+    return x0, c
+
+
+@torch.no_grad()
+def collect_latent_stats_from_arrays(model, X_all_t, te_all_t, ti_all_t, na_all_t, ua_all_t, fnixap_all_t, batch_size=64, device_local=None):
+    model.eval()
+    if device_local is None:
+        device_local = device
+    mus_q, lvs_q, mus_c, lvs_c = [], [], [], []
+    N = len(X_all_t)
+    for i in tqdm(range(0, N, batch_size), desc='diag_collect', leave=False, unit='batch'):
+        Xb = X_all_t[i:i+batch_size]
+        teb = te_all_t[i:i+batch_size]
+        tib = ti_all_t[i:i+batch_size]
+        nab = na_all_t[i:i+batch_size]
+        uab = ua_all_t[i:i+batch_size]
+        fnb = fnixap_all_t[i:i+batch_size]
+        x0, c = _prepare_batch_local((Xb, teb, tib, nab, uab, fnb), device_local)
+        mu_q, logvar_q = model.encode(x0)
+        mu_c, logvar_c = model.encode_cond(c)
+        mus_q.append(mu_q.cpu().numpy())
+        lvs_q.append(logvar_q.cpu().numpy())
+        mus_c.append(mu_c.cpu().numpy())
+        lvs_c.append(logvar_c.cpu().numpy())
+
+    mu_q_all = np.concatenate(mus_q, axis=0)
+    logvar_q_all = np.concatenate(lvs_q, axis=0)
+    mu_c_all = np.concatenate(mus_c, axis=0)
+    logvar_c_all = np.concatenate(lvs_c, axis=0)
+    return dict(mu_q=mu_q_all, logvar_q=logvar_q_all, mu_c=mu_c_all, logvar_c=logvar_c_all)
+
+
+def compute_kl_stats_from_arrays(stats):
+    mu_q = stats['mu_q']
+    lv_q = stats['logvar_q']
+    mu_c = stats['mu_c']
+    lv_c = stats['logvar_c']
+    kld_per_dim = 0.5 * (lv_c - lv_q + (np.exp(lv_q) + (mu_q - mu_c) ** 2) / np.exp(lv_c) - 1.0)
+    kld_per_sample = kld_per_dim.sum(axis=1)
+    return {
+        'kld_per_dim': kld_per_dim,
+        'kld_per_sample': kld_per_sample,
+        'kld_per_dim_mean': kld_per_dim.mean(axis=0),
+        'kld_mean': kld_per_sample.mean(),
+    }
+
+
+def save_diag_npz_and_plots(stats, kl_stats, results_dir, epoch):
+    Path(results_dir).mkdir(parents=True, exist_ok=True)
+    fname = os.path.join(results_dir, f'diagnostics_epoch_{epoch}.npz')
+    np.savez_compressed(fname,
+                        mu_q=stats['mu_q'], logvar_q=stats['logvar_q'],
+                        mu_c=stats['mu_c'], logvar_c=stats['logvar_c'],
+                        kld_per_sample=kl_stats['kld_per_sample'],
+                        kld_per_dim_mean=kl_stats['kld_per_dim_mean'])
+
+    # L2 norm between mu_q and mu_c per sample
+    l2 = np.linalg.norm(stats['mu_q'] - stats['mu_c'], axis=1)
+
+    plt.figure(figsize=(6, 4))
+    plt.hist(l2, bins=80)
+    plt.xlabel('L2 norm of mu_q - mu_c')
+    plt.ylabel('Count')
+    plt.title(f'Latent mu L2 diff epoch {epoch}')
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_dir, f'diag_mu_l2_epoch_{epoch}.png'))
+    plt.close()
+
+    plt.figure(figsize=(5, 5))
+    plt.scatter(stats['mu_c'][:, 0], stats['mu_q'][:, 0], s=2, alpha=0.3)
+    plt.xlabel('mu_c dim0')
+    plt.ylabel('mu_q dim0')
+    plt.title(f'mu_c vs mu_q (dim0) epoch {epoch}')
+    plt.savefig(os.path.join(results_dir, f'diag_mu_scatter_dim0_epoch_{epoch}.png'))
+    plt.close()
+
+    plt.figure(figsize=(6, 4))
+    plt.hist(kl_stats['kld_per_sample'], bins=80)
+    plt.xlabel('KL per sample')
+    plt.ylabel('Count')
+    plt.title(f'KL distribution epoch {epoch}')
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_dir, f'diag_kld_epoch_{epoch}.png'))
+    plt.close()
+
+    plt.figure(figsize=(8, 3))
+    plt.plot(kl_stats['kld_per_dim_mean'])
+    plt.xlabel('latent dim')
+    plt.ylabel('mean KL')
+    plt.title('Mean KL per latent dim')
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_dir, f'diag_kld_per_dim_epoch_{epoch}.png'))
+    plt.close()
+
+
+def run_and_save_diagnostics(model, X_all_t, te_all_t, ti_all_t, na_all_t, ua_all_t, fnixap_all_t, results_dir, epoch, batch_size=64):
+    stats = collect_latent_stats_from_arrays(model, X_all_t, te_all_t, ti_all_t, na_all_t, ua_all_t, fnixap_all_t, batch_size=batch_size)
+    kl_stats = compute_kl_stats_from_arrays(stats)
+    save_diag_npz_and_plots(stats, kl_stats, results_dir, epoch)
+    l2 = np.linalg.norm(stats['mu_q'] - stats['mu_c'], axis=1)
+    summary = {
+        'mu_l2_mean': float(l2.mean()),
+        'mu_l2_median': float(np.median(l2)),
+        'mu_l2_95p': float(np.percentile(l2, 95)),
+        'kld_mean': float(kl_stats['kld_mean']),
+    }
+    sname = os.path.join(results_dir, f'diagnostics_summary_epoch_{epoch}.json')
+    with open(sname, 'w') as f:
+        json.dump(summary, f, indent=2)
+    print(f'  diagnostics saved to {results_dir} (epoch {epoch})')
+    return summary
+
+# Optionally run diagnostics after diagnostic functions are defined
+if args.run_diag:
+    print('Running latent diagnostics over full test set...')
+    run_and_save_diagnostics(model, X_all, te_all, ti_all, na_all, ua_all, fnixap_all,
+                             results_dir=args.out_dir, epoch=int(ckpt.get('epoch', 0)),
+                             batch_size=args.diag_batch)
+
 # ---------------------------------------------------------------------------
 # Inference — prior mean + posterior (encoder) reconstructions
 # ---------------------------------------------------------------------------
@@ -248,16 +348,17 @@ K_POST = max(1, args.k_post)
 print(f'Averaging K={K} prior samples and K_post={K_POST} posterior samples …')
 
 with torch.no_grad():
-    c    = normalize_X(X_b)
-    x0_b = pack_normalized_fields_to_spatial(normalize_fields(te_b, ti_b, na_b, ua_b, fnixap_b).clamp(0.0, 1.0))
+    # Use training's `prepare_batch` to construct spatial input `x0_b` and condition `c`.
+    x0_b, c = prepare_batch((X_b, te_b, ti_b, na_b, ua_b, fnixap_b))
 
     acc  = torch.zeros(N, 23, NX, NY, device=device)
+    mu_c, logvar_c = model.encode_cond(c)
     for _ in range(K):
-        z   = torch.randn(N, LATENT_SIZE, device=device)
+        z   = model.reparameterize(mu_c, logvar_c)
         acc += model.decode(z, c)
     recon_prior = (acc / K).clamp(0.0, 1.0)
 
-    mu, logvar = model.encode(x0_b, c)
+    mu, logvar = model.encode(x0_b)
     if K_POST == 1:
         recon_post = model.decode(mu, c).clamp(0.0, 1.0)
     else:
@@ -269,6 +370,10 @@ with torch.no_grad():
 
 te_pr_t, ti_pr_t, na_pr_t, ua_pr_t, fnixap_pr_t = denormalize_fields(recon_prior)
 te_po_t, ti_po_t, na_po_t, ua_po_t, fnixap_po_t = denormalize_fields(recon_post)
+# The training `denormalize_fields` returns `fnixap` expanded to spatial cells
+# and flattened; average over spatial cells to get one scalar per sample.
+fnixap_pr_t = fnixap_pr_t.view(N, NX * NY).mean(dim=1)
+fnixap_po_t = fnixap_po_t.view(N, NX * NY).mean(dim=1)
 
 # NumPy copies
 def np_(t): return t.cpu().numpy()
@@ -467,26 +572,8 @@ def ns_flux_div(flat_norm):
 
 
 # We need the normalised flat tensors for GT as well — reconstruct from raw fields
-def _normalize_fields_raw(te, ti, na, ua, fnixap):
-    from torch import log as tlog
-    te_n = ((tlog(te.clamp(1e-40)) - _te_ln_min) / (_te_ln_max - _te_ln_min)
-            ).view(-1, NX*NY)
-    ti_n = ((tlog(ti.clamp(1e-40)) - _ti_ln_min) / (_ti_ln_max - _ti_ln_min)
-            ).view(-1, NX*NY)
-    na_ln = tlog(na.clamp(1e-40))
-    na_n  = ((na_ln - _na_ln_min.to(na.device)) /
-             (_na_ln_max.to(na.device) - _na_ln_min.to(na.device)))
-    na_n  = na_n.permute(0, 3, 1, 2).reshape(-1, NS*NX*NY)
-    ua_n  = ((ua - _ua_min.to(ua.device)) /
-             (_ua_max.to(ua.device) - _ua_min.to(ua.device)))
-    ua_n  = ua_n.permute(0, 3, 1, 2).reshape(-1, NS*NX*NY)
-    fn_n  = ((tlog(fnixap.view(-1,1).clamp(1e-40)) - _fnixap_ln_min) /
-             (_fnixap_ln_max - _fnixap_ln_min))
-    return torch.cat([te_n, ti_n, na_n, ua_n, fn_n], dim=1).clamp(0, 1)
-
-
 with torch.no_grad():
-    gt_flat  = _normalize_fields_raw(te_b, ti_b, na_b, ua_b, fnixap_b)
+    gt_flat  = normalize_fields(te_b, ti_b, na_b, ua_b, fnixap_b).clamp(0.0, 1.0)
     div_gt   = ns_flux_div(gt_flat)            # (N, NX-1, NY)
     div_pr   = ns_flux_div(recon_prior)
     div_po   = ns_flux_div(recon_post)
@@ -533,19 +620,20 @@ fn_all_dev = fnixap_all.to(device)
 with torch.no_grad():
     for start in range(0, len(fnixap_all), BATCH):
         sl  = slice(start, start + BATCH)
-        c_b = normalize_X(X_all_dev[sl])
-        acc = torch.zeros(c_b.shape[0], device=device)
+        # Use prepare_batch to get both spatial x0 and condition c_b
+        x0_b, c_b = prepare_batch((X_all_dev[sl], te_all_dev[sl], ti_all_dev[sl], na_all_dev[sl], ua_all_dev[sl], fn_all_dev[sl]))
+        acc = torch.zeros(x0_b.shape[0], device=device)
+        mu_c_b, logvar_c_b = model.encode_cond(c_b)
         for _ in range(K):
-            z = torch.randn(c_b.shape[0], LATENT_SIZE, device=device)
-            _, _, _, _, fn = denormalize_fields(model.decode(z, c_b))
+            z = model.reparameterize(mu_c_b, logvar_c_b)
+            _, _, _, _, fn_raw = denormalize_fields(model.decode(z, c_b))
+            fn = fn_raw.view(x0_b.shape[0], NX * NY).mean(dim=1)
             acc += fn
         fnixap_pred_all[sl] = (acc / K).cpu().numpy()
 
-        x0_b = pack_normalized_fields_to_spatial(
-            normalize_fields(te_all_dev[sl], ti_all_dev[sl], na_all_dev[sl], ua_all_dev[sl], fn_all_dev[sl]).clamp(0.0, 1.0)
-        )
-        mu_b, _ = model.encode(x0_b, c_b)
-        _, _, _, _, fn_post = denormalize_fields(model.decode(mu_b, c_b).clamp(0.0, 1.0))
+        mu_b, _ = model.encode(x0_b)
+        _, _, _, _, fn_post_raw = denormalize_fields(model.decode(mu_b, c_b).clamp(0.0, 1.0))
+        fn_post = fn_post_raw.view(x0_b.shape[0], NX * NY).mean(dim=1)
         fnixap_post_all[sl] = fn_post.cpu().numpy()
 
 fn_gt_all = fnixap_all.numpy()

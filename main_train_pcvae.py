@@ -23,6 +23,8 @@ from torch.nn import functional as F
 parser = argparse.ArgumentParser()
 parser.add_argument('--epochs',      type=int, default=150)
 parser.add_argument('--results_dir', type=str, default='train_PCVAE_results')
+parser.add_argument('--eval_temperature', type=float, default=0.85,
+                    help='Posterior latent sampling temperature used during evaluation.')
 
 if __name__ == '__main__':
     args = parser.parse_args()
@@ -48,10 +50,11 @@ LATENT_SIZE = 128
 #HIDDEN      = 2048
 BETA_KLD    = 3e-6
 FREE_BITS   = 0.5
-BETA_WARMUP = 1        # KL capacity warm-up epochs
+KL_WARMUP   = 20       # KL warm-up epochs
 KLD_CAPACITY_MAX = 3.0
 PHYS_WARMUP = 30        # physics losses warm-up epochs
 N_EVAL      = 5         # generated samples per test point
+DEFAULT_EVAL_TEMPERATURE = 0.85
 
 NX, NY, NS  = 104, 50, 10
 FIELD_SIZE  = (2 + 2*NS) * NX * NY + 1
@@ -307,7 +310,6 @@ def physics_loss_continuity(recon, target):
     j_t = na_t * ua_t
     return _metric_residual_2d(j_r, j_t, _DX_X, _DY_Y, _AREA_X, _AREA_Y)
 
-
 def physics_loss_navier_stokes(recon, target):
     """Full 2D residual of the ion momentum-flux. Derved from NS fluid equation (this is implemented instead of global momentum loss).
 
@@ -492,9 +494,17 @@ class PCVAE(nn.Module):
 
         total_skip_embed = sum(self.skip_embed_sizes)
 
-        self.bottleneck_fc1 = nn.Linear(256 * 13 * 6 + total_skip_embed + COND_SIZE, 512)
+        self.bottleneck_fc1 = nn.Linear(256 * 13 * 6 + total_skip_embed, 512)
         self.enc_mu = nn.Linear(512, LATENT_SIZE)
         self.enc_logvar = nn.Linear(512, LATENT_SIZE)
+
+        # Partial encoder c(z|y): maps condition y -> (mu_c, logvar_c)
+        # During training: z ~ q(z|x), KL = KL(q(z|x) || c(z|y))
+        # During generation: z ~ c(z|y), then x ~ p(x|z)
+        self.cond_enc_fc1 = nn.Linear(COND_SIZE, 256)
+        self.cond_enc_fc2 = nn.Linear(256, 512)
+        self.cond_mu = nn.Linear(512, LATENT_SIZE)
+        self.cond_logvar = nn.Linear(512, LATENT_SIZE)
 
         # Decoder: latent + condition -> spatial + skip features
         self.dec_fc1 = nn.Linear(LATENT_SIZE + COND_SIZE, 512)
@@ -521,9 +531,8 @@ class PCVAE(nn.Module):
         )
         self.act = nn.GELU()
 
-    def encode(self, x, c):
-        """Encode spatial input to latent distribution (condition-independent encoder)."""
-        # x: (B, 23, 104, 50), c: (B, 8)
+    def encode(self, x):
+        """Encode spatial input to latent posterior q(z|x) — condition-independent."""
         e0 = self.enc_conv0(x)                         # (B, 32, 104, 50)
         e1 = self.enc_down1(e0)                        # (B, 64, 52, 25)
         e2 = self.enc_down2(e1)                        # (B, 128, 26, 12)
@@ -536,14 +545,28 @@ class PCVAE(nn.Module):
         skips = [skip0, skip1, skip2]
 
         e3_flat = e3.view(e3.shape[0], -1)
-        bottleneck = torch.cat([e3_flat] + skips + [c], dim=1)
+        bottleneck = torch.cat([e3_flat] + skips, dim=1)
         h = self.act(self.bottleneck_fc1(bottleneck))
         mu = self.enc_mu(h)
         logvar = self.enc_logvar(h).clamp(-10, 4)
         return mu, logvar
 
-    def reparameterize(self, mu, logvar):
-        return mu + torch.randn_like(mu) * (0.5 * logvar).exp()
+    def encode_cond(self, c):
+        """Partial encoder c(z|y): maps condition y -> (mu_c, logvar_c).
+
+        Parameterises the conditional prior used in the IPA training objective
+        (Eq. 7, Harvey et al. 2022): KL(q(z|x) || c(z|y)).
+        During generation, z is sampled from c(z|y) rather than q(z|x).
+        """
+        h = self.act(self.cond_enc_fc1(c))
+        h = self.act(self.cond_enc_fc2(h))
+        mu_c = self.cond_mu(h)
+        logvar_c = self.cond_logvar(h).clamp(-10, 4)
+        return mu_c, logvar_c
+
+    def reparameterize(self, mu, logvar, temperature=1.0):
+        std = (0.5 * logvar).exp() * temperature
+        return mu + torch.randn_like(mu) * std
 
     def decode(self, z, c):
         """Decode latent + condition to spatial output with skip connections przez latent space."""
@@ -572,11 +595,12 @@ class PCVAE(nn.Module):
         h = self.dec_final(h)                     # (B, 23, 104, 50)
         return h
 
-    def forward(self, x, c):
-        mu, logvar = self.encode(x, c)
-        z = self.reparameterize(mu, logvar)
-        recon = self.decode(z, c)  # Uses stored skips
-        return recon, mu, logvar
+    def forward(self, x, c, temperature=1.0):
+        mu_q, logvar_q = self.encode(x)
+        mu_c, logvar_c = self.encode_cond(c)
+        z = self.reparameterize(mu_q, logvar_q, temperature=temperature)
+        recon = self.decode(z, c)
+        return recon, mu_q, logvar_q, mu_c, logvar_c
 
 
 # ---------------------------------------------------------------------------
@@ -588,6 +612,9 @@ def train_epoch(model, optimizer, epoch):
     total = 0.0
     # Linearly anneal physics loss weight over PHYS_WARMUP epochs
     beta_phys = min(1.0, epoch / PHYS_WARMUP)
+    # Warm-up KL pressure and KL capacity target to reduce posterior collapse.
+    beta_kl = min(1.0, epoch / max(1, KL_WARMUP))
+    kl_capacity = KLD_CAPACITY_MAX * beta_kl
     # Progress bar for batch iteration
     pbar = tqdm(train_loader, desc='train', leave=False, unit='batch')
     for batch in pbar:
@@ -597,15 +624,17 @@ def train_epoch(model, optimizer, epoch):
         optimizer.zero_grad()
         
         # Forward pass: encode and decode
-        recon, mu, logvar = model(x0, c)
-        # Clamp logvar to prevent numerical instability
-        logvar = torch.clamp(logvar, min=-10.0, max=5.0)
+        recon, mu_q, logvar_q, mu_c, logvar_c = model(x0, c)
 
         # Reconstruction loss
         mse  = LAMBDA_RECON * F.mse_loss(recon, x0)
 
-        # KL divergence loss per dimension
-        kld_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+        # KL(q(z|x) || c(z|y)) — paper eq. 7, Harvey et al. 2022
+        # For two diagonal Gaussians N(mu_q, exp(logvar_q)) vs N(mu_c, exp(logvar_c)):
+        # KL = 0.5 * sum(logvar_c - logvar_q + (exp(logvar_q) + (mu_q-mu_c)^2) / exp(logvar_c) - 1)
+        kld_per_dim = 0.5 * (logvar_c - logvar_q
+                             + (logvar_q.exp() + (mu_q - mu_c).pow(2)) / logvar_c.exp()
+                             - 1.0)
         kld  = kld_per_dim.sum(dim=1).mean()
 
         # Compute auxiliary physics losses
@@ -614,9 +643,10 @@ def train_epoch(model, optimizer, epoch):
         # KL divergence with free bits threshold (it's pretty much important because it easily collapse)
         kld_fb_per_dim = torch.clamp(kld_per_dim, min=FREE_BITS)
         kld_fb = kld_fb_per_dim.sum(dim=1).mean()
+        kld_obj = torch.abs(kld_fb - kl_capacity)
  
         # Total loss: reconstruction + KLD + annealed physics loss
-        kld_loss = BETA_KLD * kld_fb
+        kld_loss = BETA_KLD * beta_kl * kld_obj
         loss = mse + kld_loss + beta_phys * aux
   
         # Backward pass and optimization step
@@ -629,6 +659,7 @@ def train_epoch(model, optimizer, epoch):
             loss=f'{loss.item()/x0.shape[0]:.5f}',
             mse=f'{mse.item():.4f}',
             kld=f'{kld.item():.3f}',
+            kld_obj=f'{kld_obj.item():.3f}',
             E=f'{e.item():.3f}',
             cont=f'{cont.item():.3f}',
             ns=f'{ns.item():.3f}',
@@ -639,11 +670,11 @@ def train_epoch(model, optimizer, epoch):
 
 
 @torch.no_grad()
-def evaluate(model):
+def evaluate(model, temperature=DEFAULT_EVAL_TEMPERATURE):
     """Evaluate model performance on test set by computing MSE over multiple stochastic samples.
     
-    For each test batch, generates N_EVAL latent samples and reconstructs the corresponding outputs,
-    then averages the MSE across all samples and normalizes by field dimensions.
+    For each test batch, samples from q(z|x,c) at a configurable temperature and
+    averages MSE across N_EVAL stochastic reconstructions.
     """
     # Set model to evaluation mode (disables dropout, batch norm updates, etc.)
     model.eval()
@@ -665,10 +696,13 @@ def evaluate(model):
         # MSE accumulator for current batch across all N_EVAL samples
         mse = 0.0
         
+        # Evaluate conditionally by sampling from posterior q(z|x), not from prior.
+        mu, logvar = model.encode(x0)
+
         # Generate N_EVAL stochastic reconstructions per batch
         for _ in range(N_EVAL):
-            # Sample latent vectors from standard normal distribution
-            z     = torch.randn(B, LATENT_SIZE, device=device)
+            # Temperature below 1.0 follows the IPA-style sharper posterior samples used for reporting.
+            z = model.reparameterize(mu, logvar, temperature=temperature)
             
             # Decode latent vectors with condition to generate reconstruction
             recon = model.decode(z, c)
@@ -709,7 +743,8 @@ if __name__ == '__main__':
         train_loss = train_epoch(model, optimizer, epoch)
         
         # Evaluate model on validation set and get validation MSE
-        val_mse    = evaluate(model)
+        eval_temperature = args.eval_temperature if args is not None else DEFAULT_EVAL_TEMPERATURE
+        val_mse    = evaluate(model, temperature=eval_temperature)
         
         # Update learning rate according to scheduler
         scheduler.step()
