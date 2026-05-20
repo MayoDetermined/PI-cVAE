@@ -15,3 +15,5 @@ Zrobiłem to, by chronić model przed collapsem, bo skip connections pozwalało 
 3. Poza tym
 
 - Aktualnie testuję jeszcze architekturę z modelem dyfuzyjnym w latnet space: https://openaccess.thecvf.com/content/CVPR2022/papers/Rombach_High-Resolution_Image_Synthesis_With_Latent_Diffusion_Models_CVPR_2022_paper.pdf
+
+- Oraz architekturę MoE
